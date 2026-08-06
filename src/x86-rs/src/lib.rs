@@ -178,6 +178,82 @@ mod tests {
         assert_eq!(cpu.eflags & flag::ZF, 0);
     }
 
+    #[test]
+    fn cbw_cwd_obey_operand_size() {
+        let mut cpu = core_with(&[
+            0x66, 0x98, // cwde
+            0x66, 0x99, // cdq
+        ]);
+        cpu.gpr[Reg::Eax as usize] = 0x0000_8001;
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.gpr[Reg::Eax as usize], 0xFFFF_8001);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.gpr[Reg::Edx as usize], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn pop_segment_uses_operand_stack_width() {
+        let mut cpu = core_with(&[
+            0x66, 0x1F, // pop ds with 32-bit operand size
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        cpu.mem.phys_write32(0x1000, 0x1234);
+
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.seg[Seg::Ds as usize].sel, 0x1234);
+        assert_eq!(cpu.gpr[Reg::Esp as usize], 0x1004);
+    }
+
+    #[test]
+    fn lds_reads_32_bit_offset_when_operand_size_is_32() {
+        let mut cpu = core_with(&[
+            0x66, 0xC5, 0x06, 0x00, 0x01, // lds eax,[0100h]
+        ]);
+        cpu.mem.phys_write32(0x0100, 0x1234_5678);
+        cpu.mem.phys_write16(0x0104, 0x0000);
+
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.gpr[Reg::Eax as usize], 0x1234_5678);
+        assert_eq!(cpu.seg[Seg::Ds as usize].sel, 0);
+    }
+
+    #[test]
+    fn repne_scasb_stops_on_match_and_updates_count() {
+        let mut cpu = core_with(&[
+            0xF2, 0xAE, // repne scasb
+        ]);
+        cpu.set_reg8(0, 5);
+        cpu.gpr[Reg::Ecx as usize] = 3;
+        cpu.gpr[Reg::Edi as usize] = 0x0200;
+        cpu.mem.phys_write8(0x0200, 1);
+        cpu.mem.phys_write8(0x0201, 2);
+        cpu.mem.phys_write8(0x0202, 5);
+
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.reg16(Reg::Ecx as i8), 0);
+        assert_eq!(cpu.reg16(Reg::Edi as i8), 0x0203);
+        assert_ne!(cpu.eflags & flag::ZF, 0);
+    }
+
+    #[test]
+    fn string_ops_use_16_bit_address_wrap_without_clobbering_high_half() {
+        let mut cpu = core_with(&[
+            0xAC, // lodsb
+        ]);
+        cpu.gpr[Reg::Esi as usize] = 0x1234_FFFF;
+        cpu.mem.phys_write8(0xFFFF, 0xA5);
+
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.reg8(0), 0xA5);
+        assert_eq!(cpu.gpr[Reg::Esi as usize], 0x1234_0000);
+    }
+
     #[cfg(feature = "jit")]
     #[test]
     fn jit_helper_calls_and_high_byte_registers_are_correct() {

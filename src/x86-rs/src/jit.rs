@@ -1422,8 +1422,8 @@ impl<'a, 'b> Emitter<'a, 'b> {
                     _ => Bits::B8,
                 };
                 let bv = i64(self, bits_id(sb) as i64);
-                let eipv = i64(self, ins_eip as i64);
-                self.call(self.frs.string, &[op_id, rep, bv, eipv]);
+                let a16 = i64(self, d.a16 as i64);
+                self.call(self.frs.string, &[op_id, rep, bv, a16]);
             }
             Op::Cli | Op::Sti | Op::Cld | Op::Std | Op::Clc | Op::Stc | Op::Cmc | Op::Clts => {
                 let flag_id = i64(

@@ -235,6 +235,35 @@ fn pop(cpu: &mut X86, size: u32) -> Result<u32, Error> {
     Ok(v)
 }
 
+#[inline]
+fn update_index(cpu: &mut X86, reg: Reg, step: u32, a16: bool) {
+    let idx = reg as usize;
+    if a16 {
+        let v = (cpu.gpr[idx] as u16).wrapping_add(step as u16);
+        cpu.gpr[idx] = (cpu.gpr[idx] & 0xFFFF_0000) | v as u32;
+    } else {
+        cpu.gpr[idx] = cpu.gpr[idx].wrapping_add(step);
+    }
+}
+
+#[inline]
+fn count_reg(cpu: &X86, a16: bool) -> u32 {
+    if a16 {
+        cpu.gpr[Reg::Ecx as usize] & 0xFFFF
+    } else {
+        cpu.gpr[Reg::Ecx as usize]
+    }
+}
+
+#[inline]
+fn set_count(cpu: &mut X86, v: u32, a16: bool) {
+    if a16 {
+        cpu.set_reg16(Reg::Ecx as i8, v as u16);
+    } else {
+        cpu.gpr[Reg::Ecx as usize] = v;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Arithmetic
 // ---------------------------------------------------------------------------
@@ -1372,83 +1401,37 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             StepOut::Ok
         }
         Op::Movs(bits) => {
-            let di = cpu.gpr[Reg::Edi as usize];
-            let si = cpu.gpr[Reg::Esi as usize];
             let size_b = bits.bytes();
             let a16 = d.a16;
-            let b = match read_opnd(
-                cpu,
-                &Opnd::Mem(
-                    crate::decode::MemRef {
-                        seg: Seg::Ds,
-                        base: Some(6),
-                        index: None,
-                        scale: 1,
-                        disp: 0,
-                        a16,
-                    },
-                    bits,
-                ),
-                AccessKind::Read,
-            ) {
-                Ok(v) => v,
-                Err(e) => return StepOut::Error(e),
-            };
             let step = if cpu.eflags & flag::DF != 0 {
                 size_b.wrapping_neg()
             } else {
                 size_b
             };
-            // REP
-            if d.rep == Rep::Z {
-                let count = cpu.gpr[Reg::Ecx as usize];
-                if count != 0 {
-                    let n = count;
-                    for _ in 0..n {
-                        let b = match read_opnd(
-                            cpu,
-                            &Opnd::Mem(
-                                crate::decode::MemRef {
-                                    seg: Seg::Ds,
-                                    base: Some(6),
-                                    index: None,
-                                    scale: 1,
-                                    disp: 0,
-                                    a16,
-                                },
-                                bits,
-                            ),
-                            AccessKind::Read,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return StepOut::Error(e),
-                        };
-                        if let Err(e) = write_opnd(
-                            cpu,
-                            &Opnd::Mem(
-                                crate::decode::MemRef {
-                                    seg: Seg::Es,
-                                    base: Some(7),
-                                    index: None,
-                                    scale: 1,
-                                    disp: 0,
-                                    a16,
-                                },
-                                bits,
-                            ),
-                            b,
-                            AccessKind::Write,
-                        ) {
-                            return StepOut::Error(e);
-                        }
-                        let si2 = cpu.gpr[Reg::Esi as usize] as i64 + step as i64;
-                        let di2 = cpu.gpr[Reg::Edi as usize] as i64 + step as i64;
-                        cpu.gpr[Reg::Esi as usize] = si2 as u32;
-                        cpu.gpr[Reg::Edi as usize] = di2 as u32;
-                        cpu.gpr[Reg::Ecx as usize] = (cpu.gpr[Reg::Ecx as usize] as i64 - 1) as u32;
-                    }
-                }
+            let n = if d.rep == Rep::None {
+                1
             } else {
+                count_reg(cpu, a16)
+            };
+            for _ in 0..n {
+                let b = match read_opnd(
+                    cpu,
+                    &Opnd::Mem(
+                        crate::decode::MemRef {
+                            seg: Seg::Ds,
+                            base: Some(6),
+                            index: None,
+                            scale: 1,
+                            disp: 0,
+                            a16,
+                        },
+                        bits,
+                    ),
+                    AccessKind::Read,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return StepOut::Error(e),
+                };
                 if let Err(e) = write_opnd(
                     cpu,
                     &Opnd::Mem(
@@ -1467,132 +1450,109 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 ) {
                     return StepOut::Error(e);
                 }
-                cpu.gpr[Reg::Esi as usize] = si.wrapping_add_signed(step as i32);
-                cpu.gpr[Reg::Edi as usize] = di.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Esi, step, a16);
+                update_index(cpu, Reg::Edi, step, a16);
+            }
+            if d.rep != Rep::None {
+                set_count(cpu, 0, a16);
             }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Stos(bits) => {
             let size_b = bits.bytes();
+            let a16 = d.a16;
             let acc = read_gpr(cpu, 0, bits);
             let step = if cpu.eflags & flag::DF != 0 {
                 size_b.wrapping_neg()
             } else {
                 size_b
             };
-            let di = cpu.gpr[Reg::Edi as usize];
             let m = crate::decode::MemRef {
                 seg: Seg::Es,
                 base: Some(7),
                 index: None,
                 scale: 1,
                 disp: 0,
-                a16: !matches!(cpu.mode(), Mode::Protected32),
+                a16,
             };
-            if d.rep == Rep::Z {
-                let count = cpu.gpr[Reg::Ecx as usize];
-                for _ in 0..count {
-                    if let Err(e) = write_opnd(cpu, &Opnd::Mem(m, bits), acc, AccessKind::Write) {
-                        return StepOut::Error(e);
-                    }
-                    cpu.gpr[Reg::Edi as usize] =
-                        cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
-                }
-                cpu.gpr[Reg::Ecx as usize] = 0;
+            let n = if d.rep == Rep::None {
+                1
             } else {
+                count_reg(cpu, a16)
+            };
+            for _ in 0..n {
                 if let Err(e) = write_opnd(cpu, &Opnd::Mem(m, bits), acc, AccessKind::Write) {
                     return StepOut::Error(e);
                 }
-                cpu.gpr[Reg::Edi as usize] = di.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Edi, step, a16);
+            }
+            if d.rep != Rep::None {
+                set_count(cpu, 0, a16);
             }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Lods(bits) => {
             let size_b = bits.bytes();
+            let a16 = d.a16;
             let step = if cpu.eflags & flag::DF != 0 {
                 size_b.wrapping_neg()
             } else {
                 size_b
             };
-            let si = cpu.gpr[Reg::Esi as usize];
             let m = crate::decode::MemRef {
                 seg: Seg::Ds,
                 base: Some(6),
                 index: None,
                 scale: 1,
                 disp: 0,
-                a16: false,
+                a16,
             };
-            let v = match read_opnd(cpu, &Opnd::Mem(m, bits), AccessKind::Read) {
-                Ok(v) => v,
-                Err(e) => return StepOut::Error(e),
+            let n = if d.rep == Rep::None {
+                1
+            } else {
+                count_reg(cpu, a16)
             };
-            write_opnd(cpu, &Opnd::Acc(bits), v, AccessKind::Write).ok();
-            cpu.gpr[Reg::Esi as usize] = si.wrapping_add_signed(step as i32);
-            if d.rep == Rep::Z {
-                let count = cpu.gpr[Reg::Ecx as usize];
-                for _ in 0..count {
-                    let v = match read_opnd(cpu, &Opnd::Mem(m, bits), AccessKind::Read) {
-                        Ok(v) => v,
-                        Err(e) => return StepOut::Error(e),
-                    };
-                    write_opnd(cpu, &Opnd::Acc(bits), v, AccessKind::Write).ok();
-                    cpu.gpr[Reg::Esi as usize] =
-                        cpu.gpr[Reg::Esi as usize].wrapping_add_signed(step as i32);
+            for _ in 0..n {
+                let v = match read_opnd(cpu, &Opnd::Mem(m, bits), AccessKind::Read) {
+                    Ok(v) => v,
+                    Err(e) => return StepOut::Error(e),
+                };
+                if let Err(e) = write_opnd(cpu, &Opnd::Acc(bits), v, AccessKind::Write) {
+                    return StepOut::Error(e);
                 }
-                cpu.gpr[Reg::Ecx as usize] = 0;
+                update_index(cpu, Reg::Esi, step, a16);
+            }
+            if d.rep != Rep::None {
+                set_count(cpu, 0, a16);
             }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Cmps(bits) => {
             let size_b = bits.bytes();
+            let a16 = d.a16;
             let step = if cpu.eflags & flag::DF != 0 {
                 size_b.wrapping_neg()
             } else {
                 size_b
             };
-            let si = cpu.gpr[Reg::Esi as usize];
-            let di = cpu.gpr[Reg::Edi as usize];
             let m = |base: Option<u8>, seg: Seg| crate::decode::MemRef {
                 seg,
                 base,
                 index: None,
                 scale: 1,
                 disp: 0,
-                a16: false,
+                a16,
             };
-            if d.rep == Rep::Z {
-                let count = cpu.gpr[Reg::Ecx as usize];
-                let mut si = si;
-                let mut di = di;
-                for _ in 0..count {
-                    let a = match read_opnd(
-                        cpu,
-                        &Opnd::Mem(m(Some(6), Seg::Ds), bits),
-                        AccessKind::Read,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => return StepOut::Error(e),
-                    };
-                    let b = match read_opnd(
-                        cpu,
-                        &Opnd::Mem(m(Some(7), Seg::Es), bits),
-                        AccessKind::Read,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => return StepOut::Error(e),
-                    };
-                    alu(cpu, AluOp::Cmp, a, b, bits);
-                    si = si.wrapping_add_signed(step as i32);
-                    di = di.wrapping_add_signed(step as i32);
-                }
-                cpu.gpr[Reg::Esi as usize] = si;
-                cpu.gpr[Reg::Edi as usize] = di;
-                cpu.gpr[Reg::Ecx as usize] = 0;
+            let n = if d.rep == Rep::None {
+                1
             } else {
+                count_reg(cpu, a16)
+            };
+            let mut cx = n;
+            for _ in 0..n {
                 let a =
                     match read_opnd(cpu, &Opnd::Mem(m(Some(6), Seg::Ds), bits), AccessKind::Read) {
                         Ok(v) => v,
@@ -1604,20 +1564,30 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                         Err(e) => return StepOut::Error(e),
                     };
                 alu(cpu, AluOp::Cmp, a, b, bits);
-                cpu.gpr[Reg::Esi as usize] = si.wrapping_add_signed(step as i32);
-                cpu.gpr[Reg::Edi as usize] = di.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Esi, step, a16);
+                update_index(cpu, Reg::Edi, step, a16);
+                if d.rep != Rep::None {
+                    cx = cx.wrapping_sub(1);
+                    let zf = cpu.eflags & ZF != 0;
+                    if (d.rep == Rep::Z && !zf) || (d.rep == Rep::NZ && zf) {
+                        break;
+                    }
+                }
+            }
+            if d.rep != Rep::None {
+                set_count(cpu, cx, a16);
             }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Scas(bits) => {
             let size_b = bits.bytes();
+            let a16 = d.a16;
             let step = if cpu.eflags & flag::DF != 0 {
                 size_b.wrapping_neg()
             } else {
                 size_b
             };
-            let di = cpu.gpr[Reg::Edi as usize];
             let acc = read_gpr(cpu, 0, bits);
             let m = crate::decode::MemRef {
                 seg: Seg::Es,
@@ -1625,81 +1595,72 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 index: None,
                 scale: 1,
                 disp: 0,
-                a16: false,
+                a16,
             };
-            if d.rep == Rep::Z {
-                let count = cpu.gpr[Reg::Ecx as usize];
-                let mut di = di;
-                let mut cx = count;
-                for _ in 0..count {
-                    let v = match read_opnd(cpu, &Opnd::Mem(m, bits), AccessKind::Read) {
-                        Ok(v) => v,
-                        Err(e) => return StepOut::Error(e),
-                    };
-                    alu(cpu, AluOp::Cmp, acc, v, bits);
-                    di = di.wrapping_add_signed(step as i32);
-                    cx -= 1;
-                    let zf = cpu.eflags & ZF != 0;
-                    if (d.rep == Rep::Z && zf) || (d.rep == Rep::NZ && !zf) {
-                        break;
-                    }
-                }
-                cpu.gpr[Reg::Edi as usize] = di;
-                cpu.gpr[Reg::Ecx as usize] = cx;
+            let n = if d.rep == Rep::None {
+                1
             } else {
+                count_reg(cpu, a16)
+            };
+            let mut cx = n;
+            for _ in 0..n {
                 let v = match read_opnd(cpu, &Opnd::Mem(m, bits), AccessKind::Read) {
                     Ok(v) => v,
                     Err(e) => return StepOut::Error(e),
                 };
                 alu(cpu, AluOp::Cmp, acc, v, bits);
-                cpu.gpr[Reg::Edi as usize] = di.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Edi, step, a16);
+                if d.rep != Rep::None {
+                    cx = cx.wrapping_sub(1);
+                    let zf = cpu.eflags & ZF != 0;
+                    if (d.rep == Rep::Z && !zf) || (d.rep == Rep::NZ && zf) {
+                        break;
+                    }
+                }
+            }
+            if d.rep != Rep::None {
+                set_count(cpu, cx, a16);
             }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Ins(bits) => {
             let port = cpu.gpr[Reg::Edx as usize] as u16;
-            let di = cpu.gpr[Reg::Edi as usize];
+            let a16 = d.a16;
             let step = if cpu.eflags & flag::DF != 0 {
                 bits.bytes().wrapping_neg()
             } else {
                 bits.bytes()
             };
-            let v = cpu.mem.io_read(port, bits.bytes() as u8);
             let m = crate::decode::MemRef {
                 seg: Seg::Es,
                 base: Some(7),
                 index: None,
                 scale: 1,
                 disp: 0,
-                a16: false,
+                a16,
             };
-            if d.rep == Rep::Z {
-                let count = cpu.gpr[Reg::Ecx as usize];
-                let mut di = di;
-                for _ in 0..count {
-                    let v = cpu.mem.io_read(port, bits.bytes() as u8);
-                    if let Err(e) = write_opnd(cpu, &Opnd::Mem(m, bits), v, AccessKind::Write) {
-                        return StepOut::Error(e);
-                    }
-                    di = di.wrapping_add_signed(step as i32);
-                }
-                cpu.gpr[Reg::Edi as usize] = di;
-                cpu.gpr[Reg::Ecx as usize] = 0;
+            let n = if d.rep == Rep::None {
+                1
             } else {
-                let _ = v;
+                count_reg(cpu, a16)
+            };
+            for _ in 0..n {
                 let v = cpu.mem.io_read(port, bits.bytes() as u8);
                 if let Err(e) = write_opnd(cpu, &Opnd::Mem(m, bits), v, AccessKind::Write) {
                     return StepOut::Error(e);
                 }
-                cpu.gpr[Reg::Edi as usize] = di.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Edi, step, a16);
+            }
+            if d.rep != Rep::None {
+                set_count(cpu, 0, a16);
             }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Outs(bits) => {
             let port = cpu.gpr[Reg::Edx as usize] as u16;
-            let si = cpu.gpr[Reg::Esi as usize];
+            let a16 = d.a16;
             let step = if cpu.eflags & flag::DF != 0 {
                 bits.bytes().wrapping_neg()
             } else {
@@ -1711,53 +1672,42 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 index: None,
                 scale: 1,
                 disp: 0,
-                a16: false,
+                a16,
             };
-            if d.rep == Rep::Z {
-                let count = cpu.gpr[Reg::Ecx as usize];
-                let mut si = si;
-                let mut data: Vec<u8> = Vec::new();
-                for _ in 0..count {
-                    let v = match read_opnd(cpu, &Opnd::Mem(m, bits), AccessKind::Read) {
-                        Ok(v) => v,
-                        Err(e) => return StepOut::Error(e),
-                    };
-                    data.push(v as u8);
-                    si = si.wrapping_add_signed(step as i32);
-                }
-                cpu.mem.io_write(
-                    port,
-                    bits.bytes() as u8,
-                    if data.first().is_some() {
-                        data[0] as u32
-                    } else {
-                        0
-                    },
-                );
-                cpu.gpr[Reg::Esi as usize] = si;
-                cpu.gpr[Reg::Ecx as usize] = 0;
+            let n = if d.rep == Rep::None {
+                1
             } else {
+                count_reg(cpu, a16)
+            };
+            for _ in 0..n {
                 let v = match read_opnd(cpu, &Opnd::Mem(m, bits), AccessKind::Read) {
                     Ok(v) => v,
                     Err(e) => return StepOut::Error(e),
                 };
                 cpu.mem.io_write(port, bits.bytes() as u8, v);
-                cpu.gpr[Reg::Esi as usize] = si.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Esi, step, a16);
+            }
+            if d.rep != Rep::None {
+                set_count(cpu, 0, a16);
             }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Xlat => {
             let al = cpu.reg8(0) as u32;
-            let bx = cpu.gpr[Reg::Ebx as usize] as u16 as u32;
-            let off = bx.wrapping_add(al);
+            let base = if d.a16 {
+                cpu.gpr[Reg::Ebx as usize] as u16 as u32
+            } else {
+                cpu.gpr[Reg::Ebx as usize]
+            };
+            let off = base.wrapping_add(al);
             let m = crate::decode::MemRef {
                 seg: Seg::Ds,
                 base: None,
                 index: None,
                 scale: 1,
                 disp: off as i32,
-                a16: false,
+                a16: d.a16,
             };
             let v = match read_opnd(cpu, &Opnd::Mem(m, Bits::B8), AccessKind::Read) {
                 Ok(v) => v,
@@ -1907,7 +1857,7 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             StepOut::Ok
         }
         Op::PopSeg(sreg) => {
-            let sel = match pop(cpu, 2) {
+            let sel = match pop(cpu, size) {
                 Ok(v) => v,
                 Err(e) => return StepOut::Error(e),
             } as u16;
@@ -1923,8 +1873,17 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 _ => return StepOut::Error(Error::Internal("lds mem".into())),
             };
             let off = eff(cpu, &m);
-            let val = mmu::read16(cpu, m.seg, off, AccessKind::Read).map(|v| v as u32);
-            let sel = mmu::read16(cpu, m.seg, off + 2, AccessKind::Read);
+            let bits = match d.ops[0] {
+                Opnd::Reg(_, b) => b,
+                _ => Bits::B32,
+            };
+            let val = match bits {
+                Bits::B16 => mmu::read16(cpu, m.seg, off, AccessKind::Read).map(|v| v as u32),
+                Bits::B32 => mmu::read32(cpu, m.seg, off, AccessKind::Read),
+                Bits::B8 => unreachable!(),
+            };
+            let sel_off = off.wrapping_add(bits.bytes());
+            let sel = mmu::read16(cpu, m.seg, sel_off, AccessKind::Read);
             let v = match val {
                 Ok(v) => v,
                 Err(e) => return StepOut::Error(e),
@@ -1936,10 +1895,6 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             let dst = match d.ops[0] {
                 Opnd::Reg(r, _) => r,
                 _ => return StepOut::Error(Error::Internal("lds reg".into())),
-            };
-            let bits = match d.ops[0] {
-                Opnd::Reg(_, b) => b,
-                _ => Bits::B32,
             };
             write_gpr(cpu, dst, bits, v);
             let sreg = match d.op {
@@ -2349,16 +2304,27 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             StepOut::Ok
         }
         Op::Cbw => {
-            let al = cpu.reg8(0);
-            let ax = al as i8 as i16;
-            cpu.set_reg16(0, ax as u16);
+            if d.o16 {
+                let al = cpu.reg8(0);
+                let ax = al as i8 as i16;
+                cpu.set_reg16(0, ax as u16);
+            } else {
+                let ax = cpu.reg16(0);
+                cpu.set_reg32(0, ax as i16 as i32 as u32);
+            }
             cpu.eip = next;
             StepOut::Ok
         }
         Op::Cwd => {
-            let ax = cpu.reg16(0);
-            let dx = ((ax as i16) >> 15) as u16;
-            cpu.set_reg16(2, dx);
+            if d.o16 {
+                let ax = cpu.reg16(0);
+                let dx = ((ax as i16) >> 15) as u16;
+                cpu.set_reg16(2, dx);
+            } else {
+                let eax = cpu.reg32(0);
+                let edx = ((eax as i32) >> 31) as u32;
+                cpu.set_reg32(2, edx);
+            }
             cpu.eip = next;
             StepOut::Ok
         }
@@ -2578,13 +2544,13 @@ pub fn pop_public(cpu: &mut X86, size: u32) -> Result<u32, Error> {
 /// Execute one string instruction (shared by interpreter string arms and the
 /// JIT helper). `op`: 0=movs,1=stos,2=lods,3=cmps,4=scas,5=ins,6=outs.
 /// Handles REP/REPE/REPNE over the whole length, matching the interpreter.
-pub fn string_op(cpu: &mut X86, op: u8, rep: Rep, bits: Bits, _eip: u32) {
+pub fn string_op(cpu: &mut X86, op: u8, rep: Rep, bits: Bits, a16: u32) {
     let step = if cpu.eflags & flag::DF != 0 {
         bits.bytes().wrapping_neg()
     } else {
         bits.bytes()
     };
-    let a16 = !matches!(cpu.mode(), Mode::Protected32);
+    let a16 = a16 != 0;
     let mk = |base: Option<u8>, seg: Seg| MemRef {
         seg,
         base,
@@ -2598,78 +2564,64 @@ pub fn string_op(cpu: &mut X86, op: u8, rep: Rep, bits: Bits, _eip: u32) {
     match (op, rep) {
         (1, Rep::Z) => {
             // REP STOS
-            let count = cpu.gpr[Reg::Ecx as usize];
+            let count = count_reg(cpu, a16);
             for _ in 0..count {
                 let _ = write_mem(cpu, &mk(Some(7), Seg::Es), bits, acc, AccessKind::Write);
-                cpu.gpr[Reg::Edi as usize] =
-                    cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Edi, step, a16);
             }
-            cpu.gpr[Reg::Ecx as usize] = 0;
+            set_count(cpu, 0, a16);
         }
         (0, Rep::Z) => {
             // REP MOVS
-            let count = cpu.gpr[Reg::Ecx as usize];
+            let count = count_reg(cpu, a16);
             for _ in 0..count {
                 let v = read_mem(cpu, &mk(Some(6), Seg::Ds), bits, AccessKind::Read).unwrap_or(0);
                 let _ = write_mem(cpu, &mk(Some(7), Seg::Es), bits, v, AccessKind::Write);
-                cpu.gpr[Reg::Esi as usize] =
-                    cpu.gpr[Reg::Esi as usize].wrapping_add_signed(step as i32);
-                cpu.gpr[Reg::Edi as usize] =
-                    cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Esi, step, a16);
+                update_index(cpu, Reg::Edi, step, a16);
             }
-            cpu.gpr[Reg::Ecx as usize] = 0;
+            set_count(cpu, 0, a16);
         }
         (2, Rep::Z) => {
-            let count = cpu.gpr[Reg::Ecx as usize];
-            let _si = cpu.gpr[Reg::Esi as usize];
+            let count = count_reg(cpu, a16);
             for _ in 0..count {
                 let v = read_mem(cpu, &mk(Some(6), Seg::Ds), bits, AccessKind::Read).unwrap_or(0);
                 write_gpr(cpu, 0, bits, v);
-                cpu.gpr[Reg::Esi as usize] =
-                    cpu.gpr[Reg::Esi as usize].wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Esi, step, a16);
             }
-            cpu.gpr[Reg::Ecx as usize] = 0;
+            set_count(cpu, 0, a16);
         }
         (3, Rep::Z) | (3, Rep::NZ) => {
-            let count = cpu.gpr[Reg::Ecx as usize];
-            let si = cpu.gpr[Reg::Esi as usize];
-            let di = cpu.gpr[Reg::Edi as usize];
+            let count = count_reg(cpu, a16);
             let mut cx = count;
-            let mut si = si;
-            let mut di = di;
             for _ in 0..count {
                 let a = read_mem(cpu, &mk(Some(6), Seg::Ds), bits, AccessKind::Read).unwrap_or(0);
                 let b = read_mem(cpu, &mk(Some(7), Seg::Es), bits, AccessKind::Read).unwrap_or(0);
                 alu(cpu, AluOp::Cmp, a, b, bits);
-                si = si.wrapping_add_signed(step as i32);
-                di = di.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Esi, step, a16);
+                update_index(cpu, Reg::Edi, step, a16);
                 cx -= 1;
                 let zf = cpu.eflags & ZF != 0;
                 if (rep == Rep::Z && !zf) || (rep == Rep::NZ && zf) {
                     break;
                 }
             }
-            cpu.gpr[Reg::Esi as usize] = si;
-            cpu.gpr[Reg::Edi as usize] = di;
-            cpu.gpr[Reg::Ecx as usize] = cx;
+            set_count(cpu, cx, a16);
         }
         (4, Rep::Z) | (4, Rep::NZ) => {
-            let count = cpu.gpr[Reg::Ecx as usize];
-            let di = cpu.gpr[Reg::Edi as usize];
+            let count = count_reg(cpu, a16);
             let mut cx = count;
-            let mut di = di;
             for _ in 0..count {
                 let v = read_mem(cpu, &mk(Some(7), Seg::Es), bits, AccessKind::Read).unwrap_or(0);
                 alu(cpu, AluOp::Cmp, acc, v, bits);
-                di = di.wrapping_add_signed(step as i32);
+                update_index(cpu, Reg::Edi, step, a16);
                 cx -= 1;
                 let zf = cpu.eflags & ZF != 0;
-                if (rep == Rep::Z && zf) || (rep == Rep::NZ && !zf) {
+                if (rep == Rep::Z && !zf) || (rep == Rep::NZ && zf) {
                     break;
                 }
             }
-            cpu.gpr[Reg::Edi as usize] = di;
-            cpu.gpr[Reg::Ecx as usize] = cx;
+            set_count(cpu, cx, a16);
         }
         _ => {
             // Single step (possibly with a useless REP in front — the value
@@ -2679,22 +2631,18 @@ pub fn string_op(cpu: &mut X86, op: u8, rep: Rep, bits: Bits, _eip: u32) {
                     let v =
                         read_mem(cpu, &mk(Some(6), Seg::Ds), bits, AccessKind::Read).unwrap_or(0);
                     let _ = write_mem(cpu, &mk(Some(7), Seg::Es), bits, v, AccessKind::Write);
-                    cpu.gpr[Reg::Esi as usize] =
-                        cpu.gpr[Reg::Esi as usize].wrapping_add_signed(step as i32);
-                    cpu.gpr[Reg::Edi as usize] =
-                        cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
+                    update_index(cpu, Reg::Esi, step, a16);
+                    update_index(cpu, Reg::Edi, step, a16);
                 }
                 1 => {
                     let _ = write_mem(cpu, &mk(Some(7), Seg::Es), bits, acc, AccessKind::Write);
-                    cpu.gpr[Reg::Edi as usize] =
-                        cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
+                    update_index(cpu, Reg::Edi, step, a16);
                 }
                 2 => {
                     let v =
                         read_mem(cpu, &mk(Some(6), Seg::Ds), bits, AccessKind::Read).unwrap_or(0);
                     write_gpr(cpu, 0, bits, v);
-                    cpu.gpr[Reg::Esi as usize] =
-                        cpu.gpr[Reg::Esi as usize].wrapping_add_signed(step as i32);
+                    update_index(cpu, Reg::Esi, step, a16);
                 }
                 3 => {
                     let a =
@@ -2702,32 +2650,27 @@ pub fn string_op(cpu: &mut X86, op: u8, rep: Rep, bits: Bits, _eip: u32) {
                     let b =
                         read_mem(cpu, &mk(Some(7), Seg::Es), bits, AccessKind::Read).unwrap_or(0);
                     alu(cpu, AluOp::Cmp, a, b, bits);
-                    cpu.gpr[Reg::Esi as usize] =
-                        cpu.gpr[Reg::Esi as usize].wrapping_add_signed(step as i32);
-                    cpu.gpr[Reg::Edi as usize] =
-                        cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
+                    update_index(cpu, Reg::Esi, step, a16);
+                    update_index(cpu, Reg::Edi, step, a16);
                 }
                 4 => {
                     let v =
                         read_mem(cpu, &mk(Some(7), Seg::Es), bits, AccessKind::Read).unwrap_or(0);
                     alu(cpu, AluOp::Cmp, acc, v, bits);
-                    cpu.gpr[Reg::Edi as usize] =
-                        cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
+                    update_index(cpu, Reg::Edi, step, a16);
                 }
                 5 => {
                     let port = cpu.gpr[Reg::Edx as usize] as u16;
                     let v = cpu.mem.io_read(port, bits.bytes() as u8);
                     let _ = write_mem(cpu, &mk(Some(7), Seg::Es), bits, v, AccessKind::Write);
-                    cpu.gpr[Reg::Edi as usize] =
-                        cpu.gpr[Reg::Edi as usize].wrapping_add_signed(step as i32);
+                    update_index(cpu, Reg::Edi, step, a16);
                 }
                 _ => {
                     let port = cpu.gpr[Reg::Edx as usize] as u16;
                     let v =
                         read_mem(cpu, &mk(Some(6), Seg::Ds), bits, AccessKind::Read).unwrap_or(0);
                     cpu.mem.io_write(port, bits.bytes() as u8, v);
-                    cpu.gpr[Reg::Esi as usize] =
-                        cpu.gpr[Reg::Esi as usize].wrapping_add_signed(step as i32);
+                    update_index(cpu, Reg::Esi, step, a16);
                 }
             }
         }
