@@ -143,8 +143,11 @@ fn setup_machine() -> X86 {
 
     // Combined device.
     let mut pc = Pc::new();
-    if let Ok(image) = std::fs::read("Windows 98 Second Edition Boot.img") {
-        pc.machine.load_floppy(image);
+    for path in ["Disk1.img", "Windows 98 Second Edition Boot.img"] {
+        if let Ok(image) = std::fs::read(path) {
+            pc.machine.load_floppy(image);
+            break;
+        }
     }
     mem.install_device(Box::new(pc));
 
@@ -296,6 +299,7 @@ fn run_jit(cpu: &mut X86, max_steps: u64, quiet: bool) {
                     "JIT stats: {} blocks compiled, {} recompiled, {} native insns",
                     jit.blocks_compiled, jit.blocks_recompiled, jit.instructions_run
                 );
+                print_status(cpu, steps);
                 break;
             }
         }
@@ -309,6 +313,7 @@ fn run_jit(cpu: &mut X86, max_steps: u64, quiet: bool) {
                 "JIT stats: {} blocks compiled, {} recompiled, {} native insns",
                 jit.blocks_compiled, jit.blocks_recompiled, jit.instructions_run
             );
+            print_status(cpu, steps);
             break;
         }
         if steps - last_render >= 100_000 {
@@ -341,9 +346,15 @@ fn service_floppy_dma(cpu: &mut X86) {
 fn render_frame(cpu: &mut X86, screen: &mut CursesScreen) {
     let mut buf = [0u8; 0x20000];
     cpu.mem.copy_from_phys(0xA0000, &mut buf);
-    let mut vga = Vga::new();
-    vga.render(&buf);
-    screen.draw(&vga);
+    let Some(pc) = cpu
+        .mem
+        .device_mut()
+        .and_then(|device| device.as_any_mut().downcast_mut::<Pc>())
+    else {
+        return;
+    };
+    pc.vga.render(&buf);
+    screen.draw(&pc.vga);
 }
 
 fn poll_debug_output(cpu: &mut X86) {
@@ -412,12 +423,16 @@ fn print_status(cpu: &mut X86, steps: u64) {
         ],
     );
     println!(
-        "bda: timer_tick={:#010x} int08={:04x}:{:04x} shutdown={:#04x} halt_count={:#06x} b800[0..4]={:02x?}",
+        "bda: timer_tick={:#010x} int08={:04x}:{:04x} shutdown={:#04x} halt_count={:#06x} video mode={:#04x} cols={} page_off={:#06x} active_page={} b800[0..4]={:02x?}",
         cpu.mem.phys_read32(0x46C),
         cpu.mem.phys_read16(0x08 * 4 + 2),
         cpu.mem.phys_read16(0x08 * 4),
         cpu.mem.phys_read8(0x4B0),
         cpu.mem.phys_read16(0x73C),
+        cpu.mem.phys_read8(0x449),
+        cpu.mem.phys_read16(0x44A),
+        cpu.mem.phys_read16(0x44E),
+        cpu.mem.phys_read8(0x462),
         [
             cpu.mem.phys_read8(0xB8000),
             cpu.mem.phys_read8(0xB8001),
@@ -425,6 +440,25 @@ fn print_status(cpu: &mut X86, steps: u64) {
             cpu.mem.phys_read8(0xB8003),
         ]
     );
+    if let Some(pc) = cpu
+        .mem
+        .device_mut()
+        .and_then(|device| device.as_any_mut().downcast_mut::<Pc>())
+    {
+        println!("vga crtc_start={:#06x}", pc.vga.text_start_offset());
+    }
+    for row in 0..15u32 {
+        let mut line = String::with_capacity(80);
+        for col in 0..80u32 {
+            let ch = cpu.mem.phys_read8(0xB8000 + (row * 80 + col) * 2);
+            line.push(if (0x20..0x7f).contains(&ch) {
+                ch as char
+            } else {
+                ' '
+            });
+        }
+        println!("vga[{row:02}]: {line}");
+    }
     println!(
         "bda floppy: equip={:#06x} fdpt={:04x?} motor={:#04x} status={:#04x} recal={:#04x} media={:02x?} cyl={:02x?}",
         cpu.mem.phys_read16(0x410),
@@ -532,6 +566,10 @@ fn print_status(cpu: &mut X86, steps: u64) {
         .device_mut()
         .and_then(|device| device.as_any_mut().downcast_mut::<Pc>())
     {
+        if !pc.machine.debug_bytes.is_empty() {
+            let out = String::from_utf8_lossy(&pc.machine.debug_bytes);
+            println!("debug port: {out:?}");
+        }
         let debug = pc.machine.debug_state();
         println!(
             "pic/pit: cycles={} imr={:#04x} irr={:#04x} isr={:#04x} reload0={} phase0={} fired={} irq0_raised={} pit0_cmds={} pit0_writes={} last_cmd={:#04x} last_write={:#04x}@{}",

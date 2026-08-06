@@ -579,6 +579,42 @@ mod tests {
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_memory_store_does_not_fall_back_as_fault() {
+        let mut cpu = core_with(&[
+            0xC7, 0x06, 0x00, 0x02, 0x34, 0x12, // mov word [0200h],1234h
+            0xEB, 0x00, // jmp next
+        ]);
+        let mut jit = Jit::new().unwrap();
+
+        assert_eq!(jit.run(&mut cpu, 2), Ok(2));
+
+        assert_eq!(cpu.eip, 8);
+        assert_eq!(cpu.mem.phys_read16(0x0200), 0x1234);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_rep_stos_advances_to_next_eip() {
+        let mut cpu = core_with(&[
+            0xF3, 0xAB, // rep stosw
+            0xEB, 0x00, // jmp next
+        ]);
+        cpu.gpr[Reg::Ecx as usize] = 2;
+        cpu.gpr[Reg::Edi as usize] = 0x0200;
+        cpu.set_reg16(Reg::Eax as i8, 0xA55A);
+        let mut jit = Jit::new().unwrap();
+
+        assert_eq!(jit.run(&mut cpu, 2), Ok(2));
+
+        assert_eq!(cpu.eip, 4);
+        assert_eq!(cpu.reg16(Reg::Ecx as i8), 0);
+        assert_eq!(cpu.reg16(Reg::Edi as i8), 0x0204);
+        assert_eq!(cpu.mem.phys_read16(0x0200), 0xA55A);
+        assert_eq!(cpu.mem.phys_read16(0x0202), 0xA55A);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_run_limit_does_not_execute_past_requested_count() {
         let mut cpu = core_with(&[
             0xB8, 0x34, 0x12, // mov ax,1234h
@@ -621,6 +657,23 @@ mod tests {
         assert_eq!(jit.run(&mut cpu, 2), Ok(2));
 
         assert_eq!(cpu.eip, 0x0040);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_near_call_and_ret_keep_stack_pointer() {
+        let mut cpu = core_with(&[
+            0xE8, 0x01, 0x00, // call 0004h
+            0x90, // nop
+            0xC3, // ret
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        let mut jit = Jit::new().unwrap();
+
+        assert_eq!(jit.run(&mut cpu, 3), Ok(3));
+
+        assert_eq!(cpu.eip, 0x0004);
+        assert_eq!(cpu.reg16(Reg::Esp as i8), 0x1000);
     }
 
     #[cfg(feature = "jit")]

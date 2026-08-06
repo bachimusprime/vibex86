@@ -205,9 +205,10 @@ impl Vga {
     /// Render the current text mode into `frame` from VRAM.
     pub fn render(&mut self, vram: &[u8]) {
         let base = 0xB8000 - 0xA0000; // offset of text framebuffer in VGA mem
+        let start = self.text_start_offset();
         for row in 0..25u16 {
             for col in 0..80u16 {
-                let off = (row as usize * 80 + col as usize) * 2 + base;
+                let off = base + start + (row as usize * 80 + col as usize) * 2;
                 let ch = vram.get(off).copied().unwrap_or(0) as u8;
                 let attr = vram.get(off + 1).copied().unwrap_or(0) as u8;
                 self.text[row as usize][col as usize] = (ch, attr);
@@ -216,6 +217,12 @@ impl Vga {
         let changed = self.frame != self.text;
         self.frame = self.text;
         self.dirty = changed;
+    }
+
+    pub fn text_start_offset(&self) -> usize {
+        let start =
+            ((self.regs.crtc[0x0C] as usize) << 8) | self.regs.crtc[0x0D] as usize;
+        start * 2
     }
 
     pub fn io_read(&mut self, port: u16) -> u8 {

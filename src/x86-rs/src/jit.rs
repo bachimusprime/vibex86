@@ -192,7 +192,7 @@ pub unsafe extern "C" fn jit_mem_r32(cpu: *mut X86, seg: u64, off: u64, kind: u6
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_mem_w8(cpu: *mut X86, seg: u64, off: u64, val: u64, kind: u64) -> u64 {
     let c = cpu!(cpu);
-    mmu_wr(c, seg, off, kind, 1, val as u32) as u64
+    (!mmu_wr(c, seg, off, kind, 1, val as u32)) as u64
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_mem_w16(
@@ -203,7 +203,7 @@ pub unsafe extern "C" fn jit_mem_w16(
     kind: u64,
 ) -> u64 {
     let c = cpu!(cpu);
-    mmu_wr(c, seg, off, kind, 2, val as u32) as u64
+    (!mmu_wr(c, seg, off, kind, 2, val as u32)) as u64
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_mem_w32(
@@ -214,7 +214,7 @@ pub unsafe extern "C" fn jit_mem_w32(
     kind: u64,
 ) -> u64 {
     let c = cpu!(cpu);
-    mmu_wr(c, seg, off, kind, 4, val as u32) as u64
+    (!mmu_wr(c, seg, off, kind, 4, val as u32)) as u64
 }
 
 #[unsafe(no_mangle)]
@@ -252,14 +252,22 @@ pub unsafe extern "C" fn jit_stack_add(cpu: *mut X86, delta: u64) -> u64 {
 
 /// op: 0=movs, 1=stos, 2=lods, 3=cmps, 4=scas, 5=ins, 6=outs; rep: 0/1/2; bits.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_string(cpu: *mut X86, op: u64, rep: u64, bits: u64, _eip: u64) -> u64 {
+pub unsafe extern "C" fn jit_string(
+    cpu: *mut X86,
+    op: u64,
+    rep: u64,
+    bits: u64,
+    a16: u64,
+    eip: u64,
+) -> u64 {
     let c = cpu!(cpu);
     let rep = match rep {
         1 => Rep::Z,
         2 => Rep::NZ,
         _ => Rep::None,
     };
-    sem::string_op(c, op as u8, rep, bits_of(bits), 0);
+    sem::string_op(c, op as u8, rep, bits_of(bits), a16 as u32);
+    c.eip = eip as u32;
     0
 }
 
@@ -422,7 +430,7 @@ impl Jit {
 
         // Precompute every signature up front so the module borrow is not held
         // across multiple `import` calls.
-        let sigs: Vec<Signature> = (1..=4).map(|n| helper_sig(&mut module, n)).collect();
+        let sigs: Vec<Signature> = (1..=5).map(|n| helper_sig(&mut module, n)).collect();
         let imports = Imports {
             get_reg: import(&mut module, "jit_get_reg", &sigs[0])?,
             set_reg: import(&mut module, "jit_set_reg", &sigs[1])?,
@@ -444,7 +452,7 @@ impl Jit {
             push: import(&mut module, "jit_push", &sigs[1])?,
             pop: import(&mut module, "jit_pop", &sigs[0])?,
             stack_add: import(&mut module, "jit_stack_add", &sigs[0])?,
-            string: import(&mut module, "jit_string", &sigs[3])?,
+            string: import(&mut module, "jit_string", &sigs[4])?,
             flagop: import(&mut module, "jit_flagop", &sigs[0])?,
         };
 
@@ -980,6 +988,13 @@ impl<'a, 'b> Emitter<'a, 'b> {
         self.fb.inst_results(inst)[0]
     }
 
+    fn refresh_esp(&mut self) {
+        let idx = i64(self, 4);
+        let r = self.call(self.frs.get_reg, &[idx]);
+        let r32 = self.fb.ins().ireduce(types::I32, r);
+        self.fb.def_var(self.vregs[4], r32);
+    }
+
     fn mem_load_off(&mut self, seg: Seg, off: Value, bits: Bits, kind: u64, ins_eip: u32) -> Value {
         let seg = i64(self, seg as u8 as i64);
         let off64 = self.fb.ins().uextend(types::I64, off);
@@ -1232,11 +1247,13 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let v64 = self.fb.ins().uextend(types::I64, v);
                 let r = self.call(self.frs.push, &[sz, v64]);
                 self.fault_branch(r, false, ins_eip);
+                self.refresh_esp();
             }
             Op::Pop => {
                 let sz = i64(self, size.bytes() as i64);
                 let r = self.call(self.frs.pop, &[sz]);
                 self.fault_branch(r, true, ins_eip);
+                self.refresh_esp();
                 let r32 = self.fb.ins().ireduce(types::I32, r);
                 self.opnd_write(&d.ops[0], r32, ins_eip);
             }
@@ -1268,6 +1285,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let nx = i64(self, next as i64);
                 let r = self.call(self.frs.push, &[sz, nx]);
                 self.fault_branch(r, false, ins_eip);
+                self.refresh_esp();
                 let z = i32(self, 0);
                 self.fb
                     .ins()
@@ -1278,10 +1296,12 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let sz = i64(self, size.bytes() as i64);
                 let r = self.call(self.frs.pop, &[sz]);
                 self.fault_branch(r, true, ins_eip);
+                self.refresh_esp();
                 let ip = self.fb.ins().ireduce(types::I32, r);
                 if let Some(imm) = imm {
                     let iv = i64(self, imm as i64);
                     self.call(self.frs.stack_add, &[iv]);
+                    self.refresh_esp();
                 }
                 let z = i32(self, 0);
                 self.fb
@@ -1417,9 +1437,19 @@ impl<'a, 'b> Emitter<'a, 'b> {
                     | Op::Outs(b) => b,
                     _ => Bits::B8,
                 };
+                for i in 0..8 {
+                    let idx = i64(self, i as i64);
+                    let v = self.fb.use_var(self.vregs[i]);
+                    let v64 = self.fb.ins().uextend(types::I64, v);
+                    self.fb.ins().call(self.frs.set_reg, &[self.cpu, idx, v64]);
+                }
                 let bv = i64(self, bits_id(sb) as i64);
+                let next_eip = i64(self, next as i64);
                 let a16 = i64(self, d.a16 as i64);
-                self.call(self.frs.string, &[op_id, rep, bv, a16]);
+                self.call(self.frs.string, &[op_id, rep, bv, a16, next_eip]);
+                let status = i64(self, 0);
+                self.fb.ins().return_(&[status]);
+                self.terminated = true;
             }
             Op::Cli | Op::Sti | Op::Cld | Op::Std | Op::Clc | Op::Stc | Op::Cmc | Op::Clts => {
                 let flag_id = i64(
