@@ -446,8 +446,11 @@ impl Cmos {
 
 pub struct Dma {
     pub page_regs: [u8; 0x10],
+    pub addr: [u16; 4],
+    pub count: [u16; 4],
     pub mode: u8,
     pub mask: u8,
+    flip_flop: bool,
 }
 
 impl Default for Dma {
@@ -460,8 +463,11 @@ impl Dma {
     pub fn new() -> Self {
         Self {
             page_regs: [0; 0x10],
+            addr: [0; 4],
+            count: [0; 4],
             mode: 0,
             mask: 0,
+            flip_flop: false,
         }
     }
 
@@ -469,13 +475,50 @@ impl Dma {
         match port {
             0x08 => (self.mask & 0xF) | 0xF0,
             0xDA => 0x00,
+            0x81 => self.page_regs[2],
             _ => 0xFF,
         }
     }
 
-    fn write(&mut self, _port: u16, val: u8) {
-        self.mode = val;
-        let _ = val;
+    fn write(&mut self, port: u16, val: u8) {
+        match port {
+            0x04 => self.write_word_byte(2, true, val),
+            0x05 => self.write_word_byte(2, false, val),
+            0x0A => {
+                let ch = val & 0x03;
+                if val & 0x04 != 0 {
+                    self.mask |= 1 << ch;
+                } else {
+                    self.mask &= !(1 << ch);
+                }
+            }
+            0x0B => self.mode = val,
+            0x0C => self.flip_flop = false,
+            0x0D => {
+                self.flip_flop = false;
+                self.mask = 0x0F;
+            }
+            0x81 => self.page_regs[2] = val,
+            _ => {}
+        }
+    }
+
+    fn write_word_byte(&mut self, ch: usize, is_addr: bool, val: u8) {
+        let slot = if is_addr {
+            &mut self.addr[ch]
+        } else {
+            &mut self.count[ch]
+        };
+        if !self.flip_flop {
+            *slot = (*slot & 0xFF00) | val as u16;
+        } else {
+            *slot = (*slot & 0x00FF) | ((val as u16) << 8);
+        }
+        self.flip_flop = !self.flip_flop;
+    }
+
+    pub fn channel_addr(&self, ch: usize) -> u32 {
+        ((self.page_regs[ch] as u32) << 16) | self.addr[ch] as u32
     }
 }
 
@@ -488,7 +531,10 @@ pub struct Fdc {
     data: u8,
     command: u8,
     params_needed: u8,
+    params: Vec<u8>,
     result: std::collections::VecDeque<u8>,
+    disk: Option<Vec<u8>>,
+    pending_transfer: Option<Vec<u8>>,
 }
 
 impl Default for Fdc {
@@ -504,8 +550,15 @@ impl Fdc {
             data: 0,
             command: 0,
             params_needed: 0,
+            params: Vec::new(),
             result: std::collections::VecDeque::new(),
+            disk: None,
+            pending_transfer: None,
         }
+    }
+
+    pub fn load_disk(&mut self, image: Vec<u8>) {
+        self.disk = Some(image);
     }
 
     fn read(&mut self, port: u16) -> u8 {
@@ -537,7 +590,12 @@ impl Fdc {
                 self.data = val;
                 if self.params_needed == 0 {
                     self.command = val & 0x1F;
+                    self.params.clear();
                     self.params_needed = match self.command {
+                        0x03 => 2, // specify
+                        0x04 => 1, // sense drive status
+                        0x05 => 8, // write data (reported as write-protected)
+                        0x06 => 8, // read data
                         0x07 => 1, // recalibrate
                         0x08 => {
                             self.result.clear();
@@ -550,12 +608,69 @@ impl Fdc {
                     };
                     false
                 } else {
+                    self.params.push(val);
                     self.params_needed -= 1;
-                    self.params_needed == 0 && matches!(self.command, 0x07 | 0x0F)
+                    if self.params_needed == 0 {
+                        self.finish_command();
+                        matches!(self.command, 0x05 | 0x06 | 0x07 | 0x0F)
+                    } else {
+                        false
+                    }
                 }
             }
             _ => false,
         }
+    }
+
+    fn finish_command(&mut self) {
+        match self.command {
+            0x04 => {
+                let drive = self.params.first().copied().unwrap_or(0) & 0x03;
+                self.result.push_back(0x20 | drive);
+            }
+            0x05 => {
+                self.result.extend([0x40, 0x02, 0x00, 0, 0, 1, 2]);
+            }
+            0x06 => self.finish_read_data(),
+            0x07 | 0x0F => {
+                self.result.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_read_data(&mut self) {
+        let params: [u8; 8] = self.params.as_slice().try_into().unwrap_or([0; 8]);
+        let [drive_head, cyl, head, sector, size, eot, _gap, dtl] = params;
+        let _drive = drive_head & 0x03;
+        let head = head & 0x01;
+        let sector_size = if size == 0 {
+            dtl.max(128) as usize
+        } else {
+            128usize << size
+        };
+        let sectors = if eot >= sector {
+            eot - sector + 1
+        } else {
+            1
+        };
+        let lba = ((cyl as usize * 2 + head as usize) * 18) + sector.saturating_sub(1) as usize;
+        let offset = lba * sector_size;
+        let len = sectors as usize * sector_size;
+
+        self.result.clear();
+        if let Some(disk) = &self.disk {
+            if sector != 0 && offset + len <= disk.len() {
+                self.pending_transfer = Some(disk[offset..offset + len].to_vec());
+                self.result.extend([0x00, 0x00, 0x00, cyl, head, sector, size]);
+                return;
+            }
+        }
+        self.result.extend([0x40, 0x04, 0x00, cyl, head, sector, size]);
+    }
+
+    fn take_transfer(&mut self) -> Option<Vec<u8>> {
+        self.pending_transfer.take()
     }
 }
 
@@ -808,6 +923,17 @@ impl Machine {
         }
     }
 
+    pub fn load_floppy(&mut self, image: Vec<u8>) {
+        self.fdc.load_disk(image);
+    }
+
+    pub fn take_floppy_dma_transfer(&mut self) -> Option<(u32, Vec<u8>)> {
+        let mut data = self.fdc.take_transfer()?;
+        let byte_count = self.dma.count[2].wrapping_add(1) as usize;
+        data.truncate(byte_count);
+        Some((self.dma.channel_addr(2), data))
+    }
+
     fn io_read(&mut self, port: u16, _size: u8) -> u32 {
         match port {
             0x20 | 0x21 | 0xA0 | 0xA1 => self.pic.read(port) as u32,
@@ -820,7 +946,9 @@ impl Machine {
                 (v | 0x30) as u32
             }
             0x70 | 0x71 => self.cmos.read(port) as u32,
-            0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0xDA => self.dma.read(port) as u32,
+            0x04 | 0x05 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x81 | 0xDA => {
+                self.dma.read(port) as u32
+            }
             0x3F0..=0x3F7 => self.fdc.read(port) as u32,
             0x60 | 0x64 => self.ps2.read(port) as u32,
             0x3F8 => self.serial.read(port) as u32,
@@ -851,7 +979,9 @@ impl Machine {
                 self.pit.cmd(v);
             }
             0x70 | 0x71 => self.cmos.write(port, v),
-            0x08 | 0x0A | 0x0B | 0x0C | 0x0D | 0xDA => self.dma.write(port, v),
+            0x04 | 0x05 | 0x08 | 0x0A | 0x0B | 0x0C | 0x0D | 0x81 | 0xDA => {
+                self.dma.write(port, v)
+            }
             0x3F0..=0x3F7 => {
                 if self.fdc.write(port, v) {
                     self.pic.raise(Irq::Fdc as u8);

@@ -1178,6 +1178,52 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             cpu.eip = next;
             StepOut::Ok
         }
+        Op::Bound => {
+            let value = match read_opnd(cpu, &d.ops[0], AccessKind::Read) {
+                Ok(v) => v,
+                Err(e) => return StepOut::Error(e),
+            };
+            let (m, bits) = match d.ops[1] {
+                Opnd::Mem(m, bits) => (m, bits),
+                _ => return StepOut::Error(Error::Internal("BOUND mem".into())),
+            };
+            let off = eff(cpu, &m);
+            let out_of_bounds = match bits {
+                Bits::B16 => {
+                    let lower = match mmu::read16(cpu, m.seg, off, AccessKind::Read) {
+                        Ok(v) => v as i16,
+                        Err(e) => return StepOut::Error(e),
+                    };
+                    let upper = match mmu::read16(cpu, m.seg, off.wrapping_add(2), AccessKind::Read)
+                    {
+                        Ok(v) => v as i16,
+                        Err(e) => return StepOut::Error(e),
+                    };
+                    let value = value as i16;
+                    value < lower || value > upper
+                }
+                Bits::B32 => {
+                    let lower = match mmu::read32(cpu, m.seg, off, AccessKind::Read) {
+                        Ok(v) => v as i32,
+                        Err(e) => return StepOut::Error(e),
+                    };
+                    let upper = match mmu::read32(cpu, m.seg, off.wrapping_add(4), AccessKind::Read)
+                    {
+                        Ok(v) => v as i32,
+                        Err(e) => return StepOut::Error(e),
+                    };
+                    let value = value as i32;
+                    value < lower || value > upper
+                }
+                Bits::B8 => return StepOut::Error(Error::Internal("BOUND byte".into())),
+            };
+            if out_of_bounds {
+                dispatch_interrupt(cpu, 5, false, 0)
+            } else {
+                cpu.eip = next;
+                StepOut::Ok
+            }
+        }
         Op::Cmov(c) => {
             if cond_true(cpu, c) {
                 let src = match read_opnd(cpu, &d.ops[1], AccessKind::Read) {

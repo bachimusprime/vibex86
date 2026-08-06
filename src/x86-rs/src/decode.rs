@@ -198,6 +198,7 @@ pub enum Op {
     Movsx(bool), // true if source is 8-bit
     Lea,
     Xchg,
+    Bound,
     Cmov(Cond),
     Setcc(Cond),
     Push,
@@ -735,7 +736,21 @@ impl<'a> Decoder<'a> {
             }
             0x60 => Ok(self.fin(Op::PushA, [Opnd::None; 4], o16, a16, seg_ov)),
             0x61 => Ok(self.fin(Op::PopA, [Opnd::None; 4], o16, a16, seg_ov)),
-            0x62 => Err("BOUND unsupported".into()),
+            0x62 => {
+                let modrm = self.raw()?;
+                let (m, opnd, reg) = self.rm(modrm, o16, a16, seg_ov)?;
+                if m == 3 {
+                    Err("BOUND requires memory operand".into())
+                } else {
+                    Ok(self.fin(
+                        Op::Bound,
+                        [Opnd::Reg(reg, size), opnd, Opnd::None, Opnd::None],
+                        o16,
+                        a16,
+                        seg_ov,
+                    ))
+                }
+            }
             0x63 => {
                 let modrm = self.raw()?;
                 let (m, opnd, reg) = self.rm(modrm, false, a16, seg_ov)?;
@@ -968,7 +983,7 @@ impl<'a> Decoder<'a> {
             }
             0x90 => Ok(self.fin(Op::Nop, [Opnd::None; 4], o16, a16, seg_ov)),
             0x91..=0x97 => {
-                let r = b - 0x91;
+                let r = b - 0x90;
                 Ok(self.fin(
                     Op::Xchg,
                     [acc(size), Opnd::Reg(r, size), Opnd::None, Opnd::None],

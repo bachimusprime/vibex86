@@ -159,6 +159,49 @@ mod tests {
     }
 
     #[test]
+    fn one_byte_xchg_opcodes_address_the_right_register() {
+        let mut cpu = core_with(&[
+            0xB8, 0x11, 0x11, // mov ax,1111h
+            0xB9, 0x22, 0x22, // mov cx,2222h
+            0xBA, 0x33, 0x33, // mov dx,3333h
+            0x92, // xchg ax,dx
+        ]);
+
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.reg16(0), 0x3333);
+        assert_eq!(cpu.reg16(1), 0x2222);
+        assert_eq!(cpu.reg16(2), 0x1111);
+    }
+
+    #[test]
+    fn bound_checks_signed_memory_limits() {
+        let mut cpu = core_with(&[
+            0xB8, 0x05, 0x00, // mov ax,5
+            0x62, 0x06, 0x00, 0x01, // bound ax,[0100h]
+            0xB8, 0x20, 0x00, // mov ax,20h
+            0x62, 0x06, 0x00, 0x01, // bound ax,[0100h]
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        cpu.mem.phys_write16(0x0100, 0x0001);
+        cpu.mem.phys_write16(0x0102, 0x0008);
+        cpu.mem.phys_write16(5 * 4, 0x0200);
+        cpu.mem.phys_write16(5 * 4 + 2, 0x0000);
+
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 7);
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.step(), StepOut::Interrupt);
+        assert_eq!(cpu.eip, 0x0200);
+        assert_eq!(cpu.mem.phys_read16(0x0FFA), 0x000A);
+    }
+
+    #[test]
     fn div_and_idiv_use_operand_widths_and_signed_values() {
         let mut cpu = core_with(&[
             0xB8, 0x23, 0x01, // mov ax,0123h

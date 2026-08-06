@@ -141,7 +141,10 @@ fn setup_machine() -> X86 {
     mem.add_rom(0xC0000, VGA_BIOS_IMAGE.to_vec());
 
     // Combined device.
-    let pc = Pc::new();
+    let mut pc = Pc::new();
+    if let Ok(image) = std::fs::read("Windows 98 Second Edition Boot.img") {
+        pc.machine.load_floppy(image);
+    }
     mem.install_device(Box::new(pc));
 
     cpu.reset();
@@ -168,6 +171,7 @@ fn run_interp(cpu: &mut X86, max_steps: u64, quiet: bool) {
                 break;
             }
         }
+        service_floppy_dma(cpu);
         steps += 1;
         if steps > max_steps {
             eprintln!("\n[stopped after {max_steps} instructions]");
@@ -282,6 +286,7 @@ fn run_jit(cpu: &mut X86, max_steps: u64, quiet: bool) {
                 break;
             }
         }
+        service_floppy_dma(cpu);
         if steps > max_steps {
             eprintln!("\n[stopped after {max_steps} instructions]");
             eprintln!(
@@ -302,6 +307,17 @@ fn run_jit(cpu: &mut X86, max_steps: u64, quiet: bool) {
     }
     if !quiet {
         render_frame(cpu);
+    }
+}
+
+fn service_floppy_dma(cpu: &mut X86) {
+    let transfer = cpu
+        .mem
+        .device_mut()
+        .and_then(|device| device.as_any_mut().downcast_mut::<Pc>())
+        .and_then(|pc| pc.machine.take_floppy_dma_transfer());
+    if let Some((addr, data)) = transfer {
+        cpu.mem.phys_write_block(addr, &data);
     }
 }
 
@@ -353,6 +369,36 @@ fn print_status(cpu: &mut X86, steps: u64) {
         cpu.seg[1].sel, cpu.eip, cpu.eflags, cpu.halted, cpu.cr[0], cpu.cr[3]
     );
     println!(
+        "segs: es={:#06x}/{:05x} cs={:#06x}/{:05x} ss={:#06x}/{:05x} ds={:#06x}/{:05x} fs={:#06x}/{:05x} gs={:#06x}/{:05x}",
+        cpu.seg[0].sel,
+        cpu.seg[0].desc.base,
+        cpu.seg[1].sel,
+        cpu.seg[1].desc.base,
+        cpu.seg[2].sel,
+        cpu.seg[2].desc.base,
+        cpu.seg[3].sel,
+        cpu.seg[3].desc.base,
+        cpu.seg[4].sel,
+        cpu.seg[4].desc.base,
+        cpu.seg[5].sel,
+        cpu.seg[5].desc.base,
+    );
+    let ip_phys = cpu.seg[1].desc.base.wrapping_add(cpu.eip);
+    println!(
+        "code @cs:eip phys={:#07x} bytes={:02x?}",
+        ip_phys,
+        [
+            cpu.mem.phys_read8(ip_phys),
+            cpu.mem.phys_read8(ip_phys + 1),
+            cpu.mem.phys_read8(ip_phys + 2),
+            cpu.mem.phys_read8(ip_phys + 3),
+            cpu.mem.phys_read8(ip_phys + 4),
+            cpu.mem.phys_read8(ip_phys + 5),
+            cpu.mem.phys_read8(ip_phys + 6),
+            cpu.mem.phys_read8(ip_phys + 7),
+        ],
+    );
+    println!(
         "bda: timer_tick={:#010x} int08={:04x}:{:04x} shutdown={:#04x} halt_count={:#06x} b800[0..4]={:02x?}",
         cpu.mem.phys_read32(0x46C),
         cpu.mem.phys_read16(0x08 * 4 + 2),
@@ -389,6 +435,45 @@ fn print_status(cpu: &mut X86, steps: u64) {
             cpu.mem.phys_read8(0x495),
             cpu.mem.phys_read8(0x496),
             cpu.mem.phys_read8(0x497),
+        ],
+    );
+    println!(
+        "boot buf 0700={:02x?} 0720={:02x?}",
+        [
+            cpu.mem.phys_read8(0x700),
+            cpu.mem.phys_read8(0x701),
+            cpu.mem.phys_read8(0x702),
+            cpu.mem.phys_read8(0x703),
+            cpu.mem.phys_read8(0x704),
+            cpu.mem.phys_read8(0x705),
+            cpu.mem.phys_read8(0x706),
+            cpu.mem.phys_read8(0x707),
+            cpu.mem.phys_read8(0x708),
+            cpu.mem.phys_read8(0x709),
+            cpu.mem.phys_read8(0x70A),
+            cpu.mem.phys_read8(0x70B),
+            cpu.mem.phys_read8(0x70C),
+            cpu.mem.phys_read8(0x70D),
+            cpu.mem.phys_read8(0x70E),
+            cpu.mem.phys_read8(0x70F),
+        ],
+        [
+            cpu.mem.phys_read8(0x720),
+            cpu.mem.phys_read8(0x721),
+            cpu.mem.phys_read8(0x722),
+            cpu.mem.phys_read8(0x723),
+            cpu.mem.phys_read8(0x724),
+            cpu.mem.phys_read8(0x725),
+            cpu.mem.phys_read8(0x726),
+            cpu.mem.phys_read8(0x727),
+            cpu.mem.phys_read8(0x728),
+            cpu.mem.phys_read8(0x729),
+            cpu.mem.phys_read8(0x72A),
+            cpu.mem.phys_read8(0x72B),
+            cpu.mem.phys_read8(0x72C),
+            cpu.mem.phys_read8(0x72D),
+            cpu.mem.phys_read8(0x72E),
+            cpu.mem.phys_read8(0x72F),
         ],
     );
     let ss_base = cpu.seg[2].desc.base;
