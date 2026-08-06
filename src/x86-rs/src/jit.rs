@@ -505,6 +505,15 @@ impl Jit {
                         continue;
                     }
                 };
+                if entry.len as u64 > limit - count {
+                    let out = cpu.step();
+                    count += 1;
+                    if let crate::cpu::StepOut::Error(e) = out {
+                        return Err(e);
+                    }
+                    cpu.mem.tick_device(1);
+                    continue;
+                }
                 let func = entry.func;
                 let n = entry.len as u64;
                 // Safety: `func` only reads/writes `cpu` through the pointer
@@ -540,9 +549,7 @@ impl Jit {
         // Trace-decode a straight-line run of native instructions.
         let mut plan: Vec<Decoded> = Vec::new();
         let mut cur = eip0;
-        let mut tail_status: u32 = 0; // 0: continue at cur; 1: interp at cur
-        let mut reached_end = false;
-        loop {
+        let tail_status: u32 = loop {
             let saved = cpu.eip;
             cpu.eip = cur;
             let d = crate::decode::fetch(cpu).ok()?;
@@ -558,18 +565,13 @@ impl Jit {
                 }
                 NatKind::Terminal => {
                     plan.push(d);
-                    tail_status = 0;
-                    reached_end = true;
-                    break;
+                    break 0;
                 }
                 _ => {
-                    tail_status = 1;
-                    reached_end = true;
-                    break;
+                    break 1;
                 }
             }
-        }
-        let _ = reached_end;
+        };
         if plan.is_empty() {
             return None;
         }
@@ -879,7 +881,12 @@ fn widen_bool(e: &mut Emitter, b: Value) -> Value {
 
 /// Read a register as an I32 `Value` honoring the operand size.
 fn reg_val(e: &mut Emitter, reg: u8, bits: Bits) -> Value {
-    let v = e.fb.use_var(e.vregs[(reg & 7) as usize]);
+    let idx = if matches!(bits, Bits::B8) {
+        reg & 3
+    } else {
+        reg & 7
+    };
+    let v = e.fb.use_var(e.vregs[idx as usize]);
     match bits {
         Bits::B8 => {
             if reg & 4 != 0 {
@@ -902,7 +909,12 @@ fn reg_val(e: &mut Emitter, reg: u8, bits: Bits) -> Value {
 
 /// Write a register (honoring the operand size).
 fn set_reg(e: &mut Emitter, reg: u8, bits: Bits, val: Value) {
-    let old = e.fb.use_var(e.vregs[(reg & 7) as usize]);
+    let idx = if matches!(bits, Bits::B8) {
+        reg & 3
+    } else {
+        reg & 7
+    };
+    let old = e.fb.use_var(e.vregs[idx as usize]);
     match bits {
         Bits::B8 => {
             let mask = i32(e, 0xFF);
@@ -918,7 +930,7 @@ fn set_reg(e: &mut Emitter, reg: u8, bits: Bits, val: Value) {
                 let kept = e.fb.ins().band(old, keep_mask);
                 e.fb.ins().bor(kept, lo)
             };
-            e.fb.def_var(e.vregs[(reg & 7) as usize], new);
+            e.fb.def_var(e.vregs[idx as usize], new);
         }
         Bits::B16 => {
             let mask = i32(e, 0xFFFF);
@@ -926,9 +938,9 @@ fn set_reg(e: &mut Emitter, reg: u8, bits: Bits, val: Value) {
             let keep_mask = i32(e, 0xFFFF_0000);
             let kept = e.fb.ins().band(old, keep_mask);
             let new = e.fb.ins().bor(kept, lo16);
-            e.fb.def_var(e.vregs[(reg & 7) as usize], new);
+            e.fb.def_var(e.vregs[idx as usize], new);
         }
-        Bits::B32 => e.fb.def_var(e.vregs[(reg & 7) as usize], val),
+        Bits::B32 => e.fb.def_var(e.vregs[idx as usize], val),
     }
 }
 
@@ -965,21 +977,15 @@ fn eff_addr(e: &mut Emitter, m: &MemRef) -> Value {
 impl<'a, 'b> Emitter<'a, 'b> {
     /// Call an imported helper. Args must be built *before* this call.
     fn call(&mut self, fr: ir::FuncRef, args: &[Value]) -> Value {
-        let inst = self.fb.ins().call(fr, args);
+        let mut all_args = Vec::with_capacity(args.len() + 1);
+        all_args.push(self.cpu);
+        all_args.extend_from_slice(args);
+        let inst = self.fb.ins().call(fr, &all_args);
         self.fb.inst_results(inst)[0]
     }
 
-    /// `sem::cond_true` -> B1 condition value.
-    fn cond_call(&mut self, c: Cond) -> Value {
-        let arg = i64(self, cond_id(c) as i64);
-        let r = self.call(self.frs.cond, &[arg]);
-        let r32 = self.fb.ins().ireduce(types::I32, r);
-        self.fb.ins().icmp_imm_s(IntCC::NotEqual, r32, 0)
-    }
-
-    fn mem_load(&mut self, m: &MemRef, bits: Bits, kind: u64, ins_eip: u32) -> Value {
-        let seg = i64(self, m.seg as u8 as i64);
-        let off = eff_addr(self, m);
+    fn mem_load_off(&mut self, seg: Seg, off: Value, bits: Bits, kind: u64, ins_eip: u32) -> Value {
+        let seg = i64(self, seg as u8 as i64);
         let off64 = self.fb.ins().uextend(types::I64, off);
         let kindv = i64(self, kind as i64);
         let fr = match bits {
@@ -1001,6 +1007,19 @@ impl<'a, 'b> Emitter<'a, 'b> {
             }
             Bits::B32 => lo,
         }
+    }
+
+    /// `sem::cond_true` -> B1 condition value.
+    fn cond_call(&mut self, c: Cond) -> Value {
+        let arg = i64(self, cond_id(c) as i64);
+        let r = self.call(self.frs.cond, &[arg]);
+        let r32 = self.fb.ins().ireduce(types::I32, r);
+        self.fb.ins().icmp_imm_s(IntCC::NotEqual, r32, 0)
+    }
+
+    fn mem_load(&mut self, m: &MemRef, bits: Bits, kind: u64, ins_eip: u32) -> Value {
+        let off = eff_addr(self, m);
+        self.mem_load_off(m.seg, off, bits, kind, ins_eip)
     }
 
     fn mem_store(&mut self, m: &MemRef, bits: Bits, val: Value, ins_eip: u32) {
@@ -1359,16 +1378,10 @@ impl<'a, 'b> Emitter<'a, 'b> {
             Op::Xlat => {
                 let al = reg_val(self, 0, Bits::B8);
                 let bx = reg_val(self, 3, Bits::B16);
-                let _off = self.fb.ins().iadd(bx, al);
-                let m = MemRef {
-                    seg: Seg::Ds,
-                    base: None,
-                    index: None,
-                    scale: 1,
-                    disp: 0,
-                    a16: true,
-                };
-                let v = self.mem_load(&m, Bits::B8, 0, ins_eip);
+                let off = self.fb.ins().iadd(bx, al);
+                let off16 = self.fb.ins().ireduce(types::I16, off);
+                let off = self.fb.ins().uextend(types::I32, off16);
+                let v = self.mem_load_off(Seg::Ds, off, Bits::B8, 0, ins_eip);
                 set_reg(self, 0, Bits::B8, v);
             }
             Op::Movs(_)

@@ -18,6 +18,24 @@ const MASK8: u32 = 0xFF;
 const MASK16: u32 = 0xFFFF;
 
 #[inline]
+fn mask_for(sz: Bits) -> u32 {
+    match sz {
+        Bits::B8 => MASK8,
+        Bits::B16 => MASK16,
+        Bits::B32 => u32::MAX,
+    }
+}
+
+#[inline]
+fn sign_bit_for(sz: Bits) -> u32 {
+    match sz {
+        Bits::B8 => 0x80,
+        Bits::B16 => 0x8000,
+        Bits::B32 => 0x8000_0000,
+    }
+}
+
+#[inline]
 pub fn set_flags_zsp(cpu: &mut X86, val: u32, mask: u32) {
     let z = val & mask == 0;
     let s = val & (mask >> 1) != 0;
@@ -222,11 +240,10 @@ fn pop(cpu: &mut X86, size: u32) -> Result<u32, Error> {
 // ---------------------------------------------------------------------------
 
 pub fn alu(cpu: &mut X86, op: AluOp, a: u32, b: u32, sz: Bits) -> u32 {
-    let mask = match sz {
-        Bits::B8 => MASK8,
-        Bits::B16 => MASK16,
-        Bits::B32 => u32::MAX,
-    };
+    let mask = mask_for(sz);
+    let sign = sign_bit_for(sz);
+    let a = a & mask;
+    let b = b & mask;
     match op {
         AluOp::Add | AluOp::Adc => {
             let c = if op == AluOp::Adc && cpu.eflags & CF != 0 {
@@ -238,10 +255,7 @@ pub fn alu(cpu: &mut X86, op: AluOp, a: u32, b: u32, sz: Bits) -> u32 {
             let carry = (a as u64) + (b as u64) + (c as u64) > mask as u64;
             set_flags_zsp(cpu, r, mask);
             set_cf(cpu, carry);
-            set_of(
-                cpu,
-                ((a & !mask ^ (r & !mask) ^ (b & !mask)) == 0) && ((a ^ r) & (mask >> 1)) != 0,
-            );
+            set_of(cpu, ((!(a ^ b) & (a ^ r)) & sign) != 0);
             set_af(cpu, af_add(a, b, mask, r));
             r & mask
         }
@@ -263,11 +277,12 @@ pub fn alu(cpu: &mut X86, op: AluOp, a: u32, b: u32, sz: Bits) -> u32 {
             } else {
                 b
             };
+            let b_ = b_ & mask;
             let r = a.wrapping_sub(b_);
-            let borrow = (a as u64) < (b_ as u64);
+            let borrow = a < b_;
             set_flags_zsp(cpu, r, mask);
             set_cf(cpu, borrow);
-            set_of(cpu, ((a ^ b_) & (a ^ r) & (mask >> 1)) != 0);
+            set_of(cpu, ((a ^ b_) & (a ^ r) & sign) != 0);
             set_af(cpu, af_add(a, b_, mask, r));
             r & mask
         }
@@ -275,18 +290,23 @@ pub fn alu(cpu: &mut X86, op: AluOp, a: u32, b: u32, sz: Bits) -> u32 {
 }
 
 pub fn inc_dec(cpu: &mut X86, v: u32, sz: Bits, inc: bool) -> u32 {
-    let mask = match sz {
-        Bits::B8 => MASK8,
-        Bits::B16 => MASK16,
-        Bits::B32 => u32::MAX,
-    };
+    let mask = mask_for(sz);
+    let sign = sign_bit_for(sz);
+    let v = v & mask;
     let r = if inc {
         v.wrapping_add(1) & mask
     } else {
         v.wrapping_sub(1) & mask
     };
     set_flags_zsp(cpu, r, mask);
-    set_of(cpu, ((v as u32) ^ (mask >> 1)) == 0);
+    set_of(
+        cpu,
+        if inc {
+            v == sign.wrapping_sub(1)
+        } else {
+            v == sign
+        },
+    );
     set_af(cpu, (v & 0xF) == (if inc { 0xF } else { 0 }));
     r
 }
@@ -297,92 +317,112 @@ pub fn shift(cpu: &mut X86, kind: ShiftKind, v: u32, count: u32, sz: Bits) -> u3
         Bits::B16 => 16,
         _ => 32,
     };
-    let mask = match sz {
-        Bits::B8 => MASK8,
-        Bits::B16 => MASK16,
-        _ => u32::MAX,
-    };
-    let cnt = count.min(bits);
+    let mask = mask_for(sz);
+    let sign = sign_bit_for(sz);
+    let v = v & mask;
+    let cnt = count & 0x1F;
+    if cnt == 0 {
+        return v;
+    }
     match kind {
         ShiftKind::Rol => {
+            let cnt = cnt % bits;
             if cnt == 0 {
-                return v & mask;
+                return v;
             }
-            let r = v.rotate_left(cnt) & mask;
+            let r = ((v << cnt) | (v >> (bits - cnt))) & mask;
             set_cf(cpu, r & 1 != 0);
-            set_of(cpu, (r & 1) != ((r >> (bits - 1)) & 1));
+            if cnt == 1 {
+                set_of(cpu, ((r ^ (r >> 1)) & sign) != 0);
+            }
             r
         }
         ShiftKind::Ror => {
+            let cnt = cnt % bits;
             if cnt == 0 {
-                return v & mask;
+                return v;
             }
-            let r = v.rotate_right(cnt) & mask;
-            set_cf(cpu, (r & (mask >> 1)) != 0);
-            set_of(
-                cpu,
-                ((r & (mask >> 1)) != 0) != ((r >> (bits - 1)) & 1 != 0),
-            );
+            let r = ((v >> cnt) | (v << (bits - cnt))) & mask;
+            set_cf(cpu, r & sign != 0);
+            if cnt == 1 {
+                set_of(cpu, ((r ^ (r << 1)) & sign) != 0);
+            }
             r
         }
         ShiftKind::Rcl => {
+            let cnt = if bits == 32 { cnt } else { cnt % (bits + 1) };
             if cnt == 0 {
-                return v & mask;
+                return v;
             }
-            // RCL: rotate v left through the carry flag.
-            let old_cf = u64::from(cpu.eflags & CF != 0);
-            let w = ((v as u64) << 1) | old_cf;
-            let outcf = ((w >> (cnt - 1)) >> (bits + 1 - cnt)) & 1;
-            let rr = (w << (bits + 1 - cnt)) & ((1u64 << bits) - 1);
-            set_cf(cpu, outcf != 0);
+            let ring_bits = bits + 1;
+            let ring_mask = (1u64 << ring_bits) - 1;
+            let ring = ((v as u64) | (u64::from(cpu.eflags & CF != 0) << bits)) & ring_mask;
+            let rr = ((ring << cnt) | (ring >> (ring_bits - cnt))) & ring_mask;
+            let r = (rr as u32) & mask;
+            set_cf(cpu, ((rr >> bits) & 1) != 0);
             if cnt == 1 {
-                set_of(cpu, ((rr as u32) ^ (v & mask)) & (mask >> 1) != 0);
+                set_of(
+                    cpu,
+                    ((r ^ ((cpu.eflags & CF != 0) as u32 * sign)) & sign) != 0,
+                );
             }
-            rr as u32
+            r
         }
         ShiftKind::Rcr => {
+            let cnt = if bits == 32 { cnt } else { cnt % (bits + 1) };
             if cnt == 0 {
-                return v & mask;
+                return v;
             }
-            let old_cf = u64::from(cpu.eflags & CF != 0);
-            let w = (old_cf << (64 - 1)) | ((v as u64) << (64 - bits));
-            let outcf = (w >> (64 - cnt)) & 1;
-            let rr = (w >> (cnt - 1)) & ((1u64 << bits) - 1);
-            set_cf(cpu, outcf != 0);
+            let ring_bits = bits + 1;
+            let ring_mask = (1u64 << ring_bits) - 1;
+            let ring = ((v as u64) | (u64::from(cpu.eflags & CF != 0) << bits)) & ring_mask;
+            let rr = ((ring >> cnt) | (ring << (ring_bits - cnt))) & ring_mask;
+            let r = (rr as u32) & mask;
+            set_cf(cpu, ((rr >> bits) & 1) != 0);
             if cnt == 1 {
-                set_of(cpu, ((rr as u32) ^ (v & mask)) & (mask >> 1) != 0);
+                set_of(cpu, ((r ^ (r << 1)) & sign) != 0);
             }
-            rr as u32
+            r
         }
         ShiftKind::Shl => {
-            if cnt == 0 {
-                return v & mask;
+            if cnt > bits {
+                set_cf(cpu, false);
+                set_of(cpu, false);
+                set_flags_zsp(cpu, 0, mask);
+                return 0;
             }
             let r = (v << cnt) & mask;
             set_flags_zsp(cpu, r, mask);
             set_cf(cpu, ((v >> (bits - cnt)) & 1) != 0);
-            set_of(cpu, ((r & (mask >> 1)) != 0) != ((v & (mask >> 1)) != 0));
+            if cnt == 1 {
+                set_of(cpu, ((r ^ v) & sign) != 0);
+            }
             r
         }
         ShiftKind::Shr => {
-            if cnt == 0 {
-                return v & mask;
+            if cnt > bits {
+                set_cf(cpu, false);
+                set_of(cpu, false);
+                set_flags_zsp(cpu, 0, mask);
+                return 0;
             }
             let r = v >> cnt;
             set_flags_zsp(cpu, r, mask);
             set_cf(cpu, ((v >> (cnt - 1)) & 1) != 0);
-            set_of(cpu, (v & (mask >> 1)) != 0);
+            if cnt == 1 {
+                set_of(cpu, v & sign != 0);
+            }
             r
         }
         ShiftKind::Sar => {
-            if cnt == 0 {
-                return v & mask;
-            }
-            let _signed = if v & (mask >> 1) != 0 { !0u32 } else { 0 };
-            let r = ((v as i64) >> cnt) as u32 & mask;
+            let cnt = cnt.min(bits);
+            let extended = if v & sign != 0 { v | !mask } else { v };
+            let r = ((extended as i32) >> cnt) as u32 & mask;
             set_flags_zsp(cpu, r, mask);
             set_cf(cpu, ((v >> (cnt - 1)) & 1) != 0);
-            set_of(cpu, false);
+            if cnt == 1 {
+                set_of(cpu, false);
+            }
             r
         }
     }
@@ -444,7 +484,7 @@ fn mul(cpu: &mut X86, v: u32, sz: Bits, signed: bool) -> Result<(), Error> {
                 let lo = r as u32;
                 cpu.set_reg32(0, lo);
                 cpu.set_reg32(2, hi);
-                let overflow = (hi as i32 as i64) != ((lo as i32) >> 31).wrapping_mul(1) as i64;
+                let overflow = r != lo as i32 as i64;
                 set_cf(cpu, overflow);
                 set_of(cpu, overflow);
             } else {
@@ -688,7 +728,11 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 return dispatch_interrupt(cpu, 0, false, 0);
             }
             if d.op == Op::Div {
-                let wide = ((num_hi as u64) << 32) | num_lo as u64;
+                let wide = match bits {
+                    Bits::B8 => ((num_hi as u64) << 8) | num_lo as u64,
+                    Bits::B16 => ((num_hi as u64) << 16) | num_lo as u64,
+                    Bits::B32 => ((num_hi as u64) << 32) | num_lo as u64,
+                };
                 let divisor = v as u64;
                 let q = wide / divisor;
                 let r = wide % divisor;
@@ -711,14 +755,16 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 }
             } else {
                 // IDIV
-                let sign_hi = num_hi >> 31;
-                let wide = ((num_hi as u64) << 32) | num_lo as u64;
-                let n = if sign_hi != 0 {
-                    wide as i128
-                } else {
-                    wide as i128
+                let n = match bits {
+                    Bits::B8 => (((num_hi as u16) << 8) | (num_lo as u16)) as i16 as i128,
+                    Bits::B16 => (((num_hi as u32) << 16) | (num_lo as u32)) as i32 as i128,
+                    Bits::B32 => (((num_hi as u64) << 32) | (num_lo as u64)) as i64 as i128,
                 };
-                let d = v as i128;
+                let d = match bits {
+                    Bits::B8 => v as i8 as i128,
+                    Bits::B16 => v as i16 as i128,
+                    Bits::B32 => v as i32 as i128,
+                };
                 if d == 0 {
                     return dispatch_interrupt(cpu, 0, false, 0);
                 }
@@ -759,7 +805,6 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 Opnd::Reg(_, b) | Opnd::Mem(_, b) => b,
                 _ => sz,
             };
-            let a = read_gpr(cpu, reg_idx(&dst), bits);
             let imm = match d.ops[2] {
                 Opnd::Imm(v) | Opnd::ImmSext(v) => Some(v),
                 _ => None,
@@ -770,20 +815,19 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             };
             let (r, of) = match bits {
                 Bits::B16 => {
-                    let r = a.wrapping_mul(b);
-                    // OF if upper 16 bits != sign extension of low 16.
-                    (
-                        r & 0xFFFF,
-                        ((r >> 16) as u16 as i16) != ((r & 0xFFFF) as i16).signum(),
-                    )
+                    let wide = (src as i16 as i32).wrapping_mul(b as i16 as i32);
+                    let lo = wide as u16;
+                    (lo as u32, wide != lo as i16 as i32)
                 }
                 Bits::B32 => {
-                    let r = (a as u32).wrapping_mul(b);
-                    (r, ((r as i32) as i64) != ((r as i32) as i64))
+                    let wide = (src as i32 as i64).wrapping_mul(b as i32 as i64);
+                    let lo = wide as u32;
+                    (lo, wide != lo as i32 as i64)
                 }
                 Bits::B8 => {
-                    let r = (a as u8).wrapping_mul(b as u8);
-                    (r as u32, (r as i8) != (a as i8).wrapping_mul(b as i8))
+                    let wide = (src as i8 as i16).wrapping_mul(b as i8 as i16);
+                    let lo = wide as u8;
+                    (lo as u32, wide != lo as i8 as i16)
                 }
             };
             write_opnd(cpu, &dst, r, AccessKind::Write).ok();
@@ -897,18 +941,19 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             StepOut::Ok
         }
         Op::Bit(op) => {
-            let rm = match read_opnd(cpu, &d.ops[0], AccessKind::Rmw) {
+            let src_opnd = if matches!(op, BitOp::Bsf | BitOp::Bsr) {
+                d.ops[1]
+            } else {
+                d.ops[0]
+            };
+            let rm = match read_opnd(cpu, &src_opnd, AccessKind::Rmw) {
                 Ok(v) => v,
                 Err(e) => return StepOut::Error(e),
             };
-            let mem_flag = matches!(d.ops[0], Opnd::Mem(..));
-            let bits = match d.ops[0] {
+            let mem_flag = matches!(src_opnd, Opnd::Mem(..));
+            let bits = match src_opnd {
                 Opnd::Reg(_, b) | Opnd::Mem(_, b) | Opnd::Acc(b) => b,
                 _ => sz,
-            };
-            let pos_in = match read_opnd(cpu, &d.ops[1], AccessKind::Read) {
-                Ok(v) => v,
-                Err(e) => return StepOut::Error(e),
             };
             let bits_n = match bits {
                 Bits::B8 => 8,
@@ -920,12 +965,29 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 Bits::B16 => MASK16,
                 Bits::B32 => u32::MAX,
             };
-            let pos = pos_in & if mem_flag { 0x1F } else { 0 };
             match op {
                 BitOp::Bt => {
+                    let pos_in = match read_opnd(cpu, &d.ops[1], AccessKind::Read) {
+                        Ok(v) => v,
+                        Err(e) => return StepOut::Error(e),
+                    };
+                    let pos = if mem_flag {
+                        pos_in & 0x1F
+                    } else {
+                        pos_in % bits_n
+                    };
                     set_cf(cpu, (rm >> pos) & 1 != 0);
                 }
                 BitOp::Bts | BitOp::Btr | BitOp::Btc => {
+                    let pos_in = match read_opnd(cpu, &d.ops[1], AccessKind::Read) {
+                        Ok(v) => v,
+                        Err(e) => return StepOut::Error(e),
+                    };
+                    let pos = if mem_flag {
+                        pos_in & 0x1F
+                    } else {
+                        pos_in % bits_n
+                    };
                     set_cf(cpu, (rm >> pos) & 1 != 0);
                     let bit = 1u32 << pos;
                     let nv = match op {
@@ -1080,7 +1142,11 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             StepOut::Ok
         }
         Op::PushF => {
-            let flags = cpu.eflags & 0xffff;
+            let flags = if size == 2 {
+                cpu.eflags & 0xFFFF
+            } else {
+                cpu.eflags
+            };
             if let Err(e) = push(cpu, size, flags) {
                 return StepOut::Error(e);
             }
@@ -1094,7 +1160,12 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             };
             let saved = cpu.eflags & 0x100; // TF/IF/... preserved semantics
             let _ = saved;
-            cpu.eflags = (cpu.eflags & 0x100) | (v & 0xffff);
+            cpu.eflags = if size == 2 {
+                (cpu.eflags & 0xFFFF_0000) | (v & 0xFFFF)
+            } else {
+                v
+            };
+            cpu.eflags |= 0x2;
             cpu.eip = next;
             StepOut::Ok
         }
@@ -1751,7 +1822,12 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             };
             cpu.eip = ip;
             cpu.seg[Seg::Cs as usize] = crate::cpu::SegVal::real(cs as u16);
-            cpu.eflags = (fl & 0xffff) | (cpu.eflags & 0x100);
+            cpu.eflags = if size == 2 {
+                (cpu.eflags & 0xFFFF_0000) | (fl & 0xFFFF)
+            } else {
+                fl
+            };
+            cpu.eflags |= 0x2;
             StepOut::Ok
         }
         Op::Hlt => {
@@ -2451,15 +2527,6 @@ fn load_tr(cpu: &mut X86, sel: u16) -> Result<(), Error> {
 /// `alu` has already been called, so we just recompute the raw value).
 pub(crate) fn a_after(_r: u32, _bits: Bits) -> u32 {
     _r
-}
-
-/// Register index from a register operand.
-fn reg_idx(o: &Opnd) -> u8 {
-    match o {
-        Opnd::Reg(r, _) => *r,
-        Opnd::Acc(_) => 0,
-        _ => 0,
-    }
 }
 
 /// Access byte of a descriptor (for LAR).

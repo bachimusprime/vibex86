@@ -379,20 +379,22 @@ impl X86 {
     }
     #[inline]
     pub fn reg8(&self, r: i8) -> u8 {
-        let i = (r & 7) as usize;
         if r & 4 != 0 {
+            let i = (r & 3) as usize;
             (self.gpr[i] >> 8) as u8
         } else {
+            let i = (r & 3) as usize;
             self.gpr[i] as u8
         }
     }
     #[inline]
     pub fn set_reg8(&mut self, r: i8, v: u8) {
-        let i = (r & 7) as usize;
         let v = v as u32;
         if r & 4 != 0 {
+            let i = (r & 3) as usize;
             self.gpr[i] = (self.gpr[i] & 0xFFFF_00FF) | (v << 8);
         } else {
+            let i = (r & 3) as usize;
             self.gpr[i] = (self.gpr[i] & 0xFFFF_FF00) | v;
         }
     }
