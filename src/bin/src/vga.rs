@@ -305,33 +305,3 @@ impl Vga {
         }
     }
 }
-
-/// Render the VGA text screen to an ANSI string for terminal display.
-pub fn ansi_frame(vga: &Vga) -> String {
-    let mut s = String::with_capacity(25 * 82);
-    let mut cur_attr: u8 = 0xFF;
-    for row in 0..25 {
-        for col in 0..80 {
-            let (ch, attr) = vga.frame[row][col];
-            if attr != cur_attr {
-                let fg = attr & 0x0F;
-                let bg = (attr >> 4) & 0x0F;
-                s.push_str(&format!("\x1b[{};{}m", 30 + fg, 40 + bg));
-                cur_attr = attr;
-            }
-            // Avoid raw control characters.
-            let c = if (0x20..0x7F).contains(&ch) {
-                ch as char
-            } else {
-                ' '
-            };
-            s.push(c);
-        }
-        if cur_attr != 0x07 {
-            s.push_str("\x1b[0m");
-            cur_attr = 0x07;
-        }
-        s.push('\n');
-    }
-    s
-}

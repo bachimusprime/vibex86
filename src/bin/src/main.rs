@@ -7,10 +7,11 @@
 mod device;
 mod vga;
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::os::raw::{c_int, c_short, c_uint, c_void};
 
 use device::Machine;
-use vga::{BIOS_IMAGE, VGA_BIOS_IMAGE, Vga, ansi_frame};
+use vga::{BIOS_IMAGE, VGA_BIOS_IMAGE, Vga};
 use x86_rs::{StepOut, X86};
 
 use x86_rs::mem::Device;
@@ -155,11 +156,15 @@ fn setup_machine() -> X86 {
 fn run_interp(cpu: &mut X86, max_steps: u64, quiet: bool) {
     let mut steps = 0u64;
     let mut last_render = 0u64;
+    let mut screen = (!quiet).then(CursesScreen::new);
     loop {
         trace_bios_diskette(cpu, steps);
         match cpu.step() {
             StepOut::Ok | StepOut::Interrupt => {}
             StepOut::Error(e) => {
+                if let Some(screen) = &mut screen {
+                    screen.finish();
+                }
                 if !quiet {
                     poll_debug_output(cpu);
                 }
@@ -174,22 +179,26 @@ fn run_interp(cpu: &mut X86, max_steps: u64, quiet: bool) {
         service_floppy_dma(cpu);
         steps += 1;
         if steps > max_steps {
+            if let Some(screen) = &mut screen {
+                screen.finish();
+            }
             eprintln!("\n[stopped after {max_steps} instructions]");
             print_status(cpu, steps);
             break;
         }
         if steps - last_render >= 100_000 {
             last_render = steps;
-            if !quiet {
-                render_frame(cpu);
+            if let Some(screen) = &mut screen {
+                render_frame(cpu, screen);
             }
         }
-        if !quiet {
-            poll_debug_output(cpu);
-        }
+    }
+    if let Some(screen) = &mut screen {
+        render_frame(cpu, screen);
+        screen.finish();
     }
     if !quiet {
-        render_frame(cpu);
+        poll_debug_output(cpu);
     }
 }
 
@@ -268,10 +277,14 @@ fn run_jit(cpu: &mut X86, max_steps: u64, quiet: bool) {
     };
     let mut steps = 0u64;
     let mut last_render = 0u64;
+    let mut screen = (!quiet).then(CursesScreen::new);
     loop {
         match jit.run(cpu, 4096) {
             Ok(n) => steps += n,
             Err(e) => {
+                if let Some(screen) = &mut screen {
+                    screen.finish();
+                }
                 if !quiet {
                     poll_debug_output(cpu);
                 }
@@ -288,6 +301,9 @@ fn run_jit(cpu: &mut X86, max_steps: u64, quiet: bool) {
         }
         service_floppy_dma(cpu);
         if steps > max_steps {
+            if let Some(screen) = &mut screen {
+                screen.finish();
+            }
             eprintln!("\n[stopped after {max_steps} instructions]");
             eprintln!(
                 "JIT stats: {} blocks compiled, {} recompiled, {} native insns",
@@ -297,16 +313,17 @@ fn run_jit(cpu: &mut X86, max_steps: u64, quiet: bool) {
         }
         if steps - last_render >= 100_000 {
             last_render = steps;
-            if !quiet {
-                render_frame(cpu);
+            if let Some(screen) = &mut screen {
+                render_frame(cpu, screen);
             }
         }
-        if !quiet {
-            poll_debug_output(cpu);
-        }
+    }
+    if let Some(screen) = &mut screen {
+        render_frame(cpu, screen);
+        screen.finish();
     }
     if !quiet {
-        render_frame(cpu);
+        poll_debug_output(cpu);
     }
 }
 
@@ -321,16 +338,12 @@ fn service_floppy_dma(cpu: &mut X86) {
     }
 }
 
-fn render_frame(cpu: &mut X86) {
-    // Draw the current VGA text screen to the terminal.
+fn render_frame(cpu: &mut X86, screen: &mut CursesScreen) {
     let mut buf = [0u8; 0x20000];
     cpu.mem.copy_from_phys(0xA0000, &mut buf);
-    // Rebuild a Vga view from the raw bytes.
     let mut vga = Vga::new();
     vga.render(&buf);
-    let s = ansi_frame(&vga);
-    print!("\x1b[2J\x1b[H{s}");
-    io::stdout().flush().ok();
+    screen.draw(&vga);
 }
 
 fn poll_debug_output(cpu: &mut X86) {
@@ -548,4 +561,92 @@ fn print_status(cpu: &mut X86, steps: u64) {
 
 fn flush_stdout() {
     io::stdout().flush().ok();
+}
+
+type Window = c_void;
+type Chtype = c_uint;
+
+const A_BOLD: Chtype = 1 << 13;
+
+#[link(name = "ncursesw")]
+unsafe extern "C" {
+    fn initscr() -> *mut Window;
+    fn endwin() -> c_int;
+    fn noecho() -> c_int;
+    fn cbreak() -> c_int;
+    fn curs_set(visibility: c_int) -> c_int;
+    fn start_color() -> c_int;
+    fn use_default_colors() -> c_int;
+    fn init_pair(pair: c_short, fg: c_short, bg: c_short) -> c_int;
+    fn erase() -> c_int;
+    fn refresh() -> c_int;
+    fn mvaddch(y: c_int, x: c_int, ch: Chtype) -> c_int;
+}
+
+struct CursesScreen {
+    active: bool,
+}
+
+impl CursesScreen {
+    fn new() -> Self {
+        unsafe {
+            initscr();
+            cbreak();
+            noecho();
+            curs_set(0);
+            start_color();
+            use_default_colors();
+            for bg in 0..8 {
+                for fg in 0..8 {
+                    init_pair(Self::pair_id(fg, bg) as c_short, fg as c_short, bg as c_short);
+                }
+            }
+            erase();
+            refresh();
+        }
+        Self { active: true }
+    }
+
+    fn draw(&mut self, vga: &Vga) {
+        if !self.active {
+            return;
+        }
+        unsafe {
+            for row in 0..25 {
+                for col in 0..80 {
+                    let (ch, attr) = vga.frame[row][col];
+                    mvaddch(row as c_int, col as c_int, Self::cell_chtype(ch, attr));
+                }
+            }
+            refresh();
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.active {
+            unsafe {
+                endwin();
+            }
+            self.active = false;
+        }
+    }
+
+    fn pair_id(fg: u8, bg: u8) -> u8 {
+        bg * 8 + fg + 1
+    }
+
+    fn cell_chtype(ch: u8, attr: u8) -> Chtype {
+        let fg = attr & 0x0F;
+        let bg = (attr >> 4) & 0x07;
+        let printable = if (0x20..0x7F).contains(&ch) { ch } else { b' ' };
+        let pair = Self::pair_id(fg & 0x07, bg);
+        let bright = if fg & 0x08 != 0 { A_BOLD } else { 0 };
+        printable as Chtype | ((pair as Chtype) << 8) | bright
+    }
+}
+
+impl Drop for CursesScreen {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
