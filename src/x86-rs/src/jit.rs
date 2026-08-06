@@ -357,10 +357,29 @@ fn block_key(cpu: &X86) -> u64 {
     ((cpu.seg[Seg::Cs as usize].sel as u64) << 32) | cpu.eip as u64
 }
 
+/// State signature for cached-block validity.
+///
+/// The JIT emits *native* code that reads `cpu.seg` (interpreter-fallbacks
+/// update the segment registers between blocks). A block must be recompiled
+/// whenever the segment cache, descriptor tables, or CR0 change, otherwise a
+/// stale block compiled for one DS/ES/SS base is reused after the segment is
+/// reloaded and memory accesses translate through the wrong base. The FNV-1a
+/// fold is a non-cryptographic mixing function; collisions only cause a
+/// (safe) recompile.
 fn state_sig(cpu: &X86) -> u64 {
-    let g = cpu.gdtr.base ^ (cpu.gdtr.limit as u32).rotate_left(16);
-    let i = cpu.idtr.base ^ (cpu.idtr.limit as u32).rotate_left(24);
-    (cpu.cr[0] as u64) ^ ((g as u64) << 16) ^ ((i as u64) << 40)
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x1_0000_01b3);
+    };
+    mix(cpu.cr[0] as u64);
+    mix((cpu.gdtr.base as u64) ^ ((cpu.gdtr.limit as u64) << 32));
+    mix((cpu.idtr.base as u64) ^ ((cpu.idtr.limit as u64) << 32));
+    for s in &cpu.seg {
+        mix((s.sel as u64) ^ ((s.desc.base as u64) << 16));
+    }
+    mix(cpu.ldtr.sel as u64);
+    h
 }
 
 /// JIT engine.
@@ -510,12 +529,13 @@ impl Jit {
                     }
                 };
                 if entry.len as u64 > limit - count {
+                    // `cpu.step()` (interpreter) already ticks the device;
+                    // do not tick again here.
                     let out = cpu.step();
                     count += 1;
                     if let crate::cpu::StepOut::Error(e) = out {
                         return Err(e);
                     }
-                    cpu.mem.tick_device(1);
                     continue;
                 }
                 let func = entry.func;
@@ -531,12 +551,13 @@ impl Jit {
             self.instructions_run += n;
 
             if status == 1 {
+                // `cpu.step()` already ticks the device once for the
+                // fallback instruction; do not tick again here.
                 let out = cpu.step();
                 if let crate::cpu::StepOut::Error(e) = out {
                     return Err(e);
                 }
                 count += 1;
-                cpu.mem.tick_device(1);
             }
             if n > 0 {
                 cpu.mem.tick_device(n);
@@ -995,6 +1016,20 @@ impl<'a, 'b> Emitter<'a, 'b> {
         self.fb.def_var(self.vregs[4], r32);
     }
 
+    /// Push the cached ESP variable back into `cpu.gpr[4]` *before* a stack
+    /// helper runs. The stack helpers (`jit_push`/`jit_pop`/`jit_stack_add`)
+    /// read/write the real `cpu.gpr[4]`, but the block keeps a register
+    /// variable that is only flushed at the epilogue. Without this, a
+    /// `mov sp, imm` followed by `push` writes the value to the *old* stack
+    /// location, and `pop` reads from it too — the first few BIOS pushes
+    /// skew the stack and corrupt the boot.
+    fn flush_esp(&mut self) {
+        let idx = i64(self, 4);
+        let v = self.fb.use_var(self.vregs[4]);
+        let v64 = self.fb.ins().uextend(types::I64, v);
+        self.fb.ins().call(self.frs.set_reg, &[self.cpu, idx, v64]);
+    }
+
     fn mem_load_off(&mut self, seg: Seg, off: Value, bits: Bits, kind: u64, ins_eip: u32) -> Value {
         let seg = i64(self, seg as u8 as i64);
         let off64 = self.fb.ins().uextend(types::I64, off);
@@ -1245,12 +1280,14 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let v = self.opnd_read(&d.ops[0], ins_eip);
                 let sz = i64(self, size.bytes() as i64);
                 let v64 = self.fb.ins().uextend(types::I64, v);
+                self.flush_esp();
                 let r = self.call(self.frs.push, &[sz, v64]);
                 self.fault_branch(r, false, ins_eip);
                 self.refresh_esp();
             }
             Op::Pop => {
                 let sz = i64(self, size.bytes() as i64);
+                self.flush_esp();
                 let r = self.call(self.frs.pop, &[sz]);
                 self.fault_branch(r, true, ins_eip);
                 self.refresh_esp();
@@ -1283,6 +1320,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 };
                 let sz = i64(self, size.bytes() as i64);
                 let nx = i64(self, next as i64);
+                self.flush_esp();
                 let r = self.call(self.frs.push, &[sz, nx]);
                 self.fault_branch(r, false, ins_eip);
                 self.refresh_esp();
@@ -1294,6 +1332,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
             }
             Op::Ret { far: false, imm } => {
                 let sz = i64(self, size.bytes() as i64);
+                self.flush_esp();
                 let r = self.call(self.frs.pop, &[sz]);
                 self.fault_branch(r, true, ins_eip);
                 self.refresh_esp();
