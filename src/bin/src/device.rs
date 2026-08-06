@@ -100,9 +100,9 @@ impl PicChip {
             self.auto_eoi = false;
             return;
         }
-        if val & 0x08 == 0 && val & 0x04 != 0 && self.icw_step == 0 {
-            // OCW2 (EOI etc). Only auto-EOI path: non-specific EOI clears the
-            // highest priority in-service.
+        if val & 0x18 == 0 && self.icw_step == 0 {
+            // OCW2. Non-specific EOI is 0x20; Bochs' timer handler sends this
+            // after updating the BDA tick counter.
             if val & 0x20 != 0 {
                 let isr = self.isr;
                 self.isr &= !(isr & isr.wrapping_neg());
@@ -222,6 +222,8 @@ pub struct Pit {
     latched: [bool; 3],
     /// True when channel 0 expired (drives the timer IRQ).
     pub timer_fired: bool,
+    /// 8254 access mode: 1=low byte, 2=high byte, 3=low/high.
+    access: [u8; 3],
     /// Write pointer for 16-bit loads.
     low_byte: [bool; 3],
 }
@@ -234,7 +236,7 @@ impl Default for Pit {
 
 impl Pit {
     pub fn new() -> Self {
-        Self {
+        let mut pit = Self {
             count: [0; 3],
             reload: [0; 3],
             phases: [0; 3],
@@ -243,8 +245,11 @@ impl Pit {
             latch: [0; 3],
             latched: [false; 3],
             timer_fired: false,
+            access: [3; 3],
             low_byte: [true; 3],
-        }
+        };
+        pit.phases[0] = Self::effective_reload(pit.reload[0]);
+        pit
     }
 
     fn read(&mut self, port: u16) -> u8 {
@@ -265,16 +270,34 @@ impl Pit {
         if ch >= 3 {
             return;
         }
-        if self.low_byte[ch] {
-            self.count[ch] = (self.count[ch] & 0xFF00) | val as u16;
-        } else {
-            self.count[ch] = (self.count[ch] & 0x00FF) | ((val as u16) << 8);
-            self.reload[ch] = self.count[ch];
-            if self.reload[ch] != 0 {
-                self.phases[ch] = self.reload[ch] as u64;
+        match self.access[ch] {
+            1 => {
+                self.count[ch] = (self.count[ch] & 0xFF00) | val as u16;
+                self.reload_counter(ch);
+            }
+            2 => {
+                self.count[ch] = (self.count[ch] & 0x00FF) | ((val as u16) << 8);
+                self.reload_counter(ch);
+            }
+            _ => {
+                if self.low_byte[ch] {
+                    self.count[ch] = (self.count[ch] & 0xFF00) | val as u16;
+                } else {
+                    self.count[ch] = (self.count[ch] & 0x00FF) | ((val as u16) << 8);
+                    self.reload_counter(ch);
+                }
+                self.low_byte[ch] = !self.low_byte[ch];
             }
         }
-        self.low_byte[ch] = !self.low_byte[ch];
+    }
+
+    fn effective_reload(reload: u16) -> u64 {
+        if reload == 0 { 65_536 } else { reload as u64 }
+    }
+
+    fn reload_counter(&mut self, ch: usize) {
+        self.reload[ch] = self.count[ch];
+        self.phases[ch] = Self::effective_reload(self.reload[ch]);
     }
 
     fn cmd(&mut self, val: u8) {
@@ -303,18 +326,24 @@ impl Pit {
         if access == 0 {
             return; // latch count
         }
+        self.access[ch] = access;
         self.low_byte[ch] = true;
-        self.count[ch] = 0;
     }
 
     pub fn tick(&mut self, cycles: u64) {
         self.timer_fired = false;
         for ch in 0..3 {
-            if !self.gate[ch] || self.phases[ch] == 0 {
+            if !self.gate[ch] {
+                continue;
+            }
+            if ch == 0 && self.phases[ch] == 0 {
+                self.phases[ch] = Self::effective_reload(self.reload[ch]);
+            }
+            if self.phases[ch] == 0 {
                 continue;
             }
             if cycles >= self.phases[ch] {
-                self.phases[ch] = self.reload[ch] as u64;
+                self.phases[ch] = Self::effective_reload(self.reload[ch]);
                 if ch == 2 {
                     self.out2 = !self.out2;
                 }
@@ -323,11 +352,6 @@ impl Pit {
                 }
             } else {
                 self.phases[ch] -= cycles;
-                // keep the phase >= 1 so a partial tick does not spuriously
-                // fire; subtract at least 1 if cycles >= 1 and phase given.
-            }
-            if cycles > 0 && self.phases[ch] > 0 {
-                self.phases[ch] = self.phases[ch].saturating_sub(1);
             }
         }
     }
@@ -367,7 +391,7 @@ impl Cmos {
         regs[0x0F] = 0x00;
         // Drive types: A = 1.44 MB, B = none.
         regs[0x10] = 0x10;
-        regs[0x12] = 0x10;
+        regs[0x12] = 0x00;
         // Base memory 640K.
         regs[0x15] = 0x00;
         regs[0x16] = 0x28;
@@ -379,6 +403,11 @@ impl Cmos {
         regs[0x31] = 0x3F;
         regs[0x32] = 0x00;
         regs[0x33] = 0x3F;
+        // Bochs BIOS boot sequence, packed as 4-bit device ids. 0 is invalid;
+        // leave a normal floppy-first order so POST does not underflow the
+        // boot-device index before INT 19h.
+        regs[0x38] = 0x00;
+        regs[0x3D] = 0x01;
         Self {
             regs,
             sel: 0,
@@ -447,6 +476,86 @@ impl Dma {
     fn write(&mut self, _port: u16, val: u8) {
         self.mode = val;
         let _ = val;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEC uPD765 / Intel 8272 floppy controller (minimal POST/boot stub)
+// ---------------------------------------------------------------------------
+
+pub struct Fdc {
+    dor: u8,
+    data: u8,
+    command: u8,
+    params_needed: u8,
+    result: std::collections::VecDeque<u8>,
+}
+
+impl Default for Fdc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fdc {
+    pub fn new() -> Self {
+        Self {
+            dor: 0,
+            data: 0,
+            command: 0,
+            params_needed: 0,
+            result: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn read(&mut self, port: u16) -> u8 {
+        match port {
+            // Main Status Register: RQM set; DIO follows whether a result byte
+            // is waiting for the CPU.
+            0x3F4 => {
+                if self.result.is_empty() {
+                    0x80
+                } else {
+                    0xC0
+                }
+            }
+            0x3F5 => self.result.pop_front().unwrap_or(self.data),
+            // Digital input register: disk-change line inactive.
+            0x3F7 => 0x00,
+            _ => 0xFF,
+        }
+    }
+
+    fn write(&mut self, port: u16, val: u8) -> bool {
+        match port {
+            0x3F2 => {
+                let reset_released = self.dor & 0x04 == 0 && val & 0x04 != 0;
+                self.dor = val;
+                reset_released
+            }
+            0x3F5 => {
+                self.data = val;
+                if self.params_needed == 0 {
+                    self.command = val & 0x1F;
+                    self.params_needed = match self.command {
+                        0x07 => 1, // recalibrate
+                        0x08 => {
+                            self.result.clear();
+                            self.result.push_back(0x20); // seek/recal complete
+                            self.result.push_back(0x00); // present cylinder
+                            0
+                        }
+                        0x0F => 2, // seek
+                        _ => 0,
+                    };
+                    false
+                } else {
+                    self.params_needed -= 1;
+                    self.params_needed == 0 && matches!(self.command, 0x07 | 0x0F)
+                }
+            }
+            _ => false,
+        }
     }
 }
 
@@ -641,11 +750,35 @@ pub struct Machine {
     pub pit: Pit,
     pub cmos: Cmos,
     pub dma: Dma,
+    pub fdc: Fdc,
     pub ps2: Ps2Kbd,
     pub serial: Serial,
     /// Port E9 debug output from the Bochs BIOS.
     pub debug_bytes: Vec<u8>,
     pub total_cycles: u64,
+    pub timer_irqs_raised: u64,
+    pub pit0_cmds: u64,
+    pub pit0_writes: u64,
+    pub last_pit0_cmd: u8,
+    pub last_pit0_write: u8,
+    pub last_pit0_cycle: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MachineDebug {
+    pub total_cycles: u64,
+    pub pic_imr: u8,
+    pub pic_irr: u8,
+    pub pic_isr: u8,
+    pub pit_reload0: u16,
+    pub pit_phase0: u64,
+    pub pit_timer_fired: bool,
+    pub timer_irqs_raised: u64,
+    pub pit0_cmds: u64,
+    pub pit0_writes: u64,
+    pub last_pit0_cmd: u8,
+    pub last_pit0_write: u8,
+    pub last_pit0_cycle: u64,
 }
 
 impl Default for Machine {
@@ -661,10 +794,17 @@ impl Machine {
             pit: Pit::new(),
             cmos: Cmos::new(),
             dma: Dma::new(),
+            fdc: Fdc::new(),
             ps2: Ps2Kbd::new(),
             serial: Serial::new(),
             debug_bytes: Vec::new(),
             total_cycles: 0,
+            timer_irqs_raised: 0,
+            pit0_cmds: 0,
+            pit0_writes: 0,
+            last_pit0_cmd: 0,
+            last_pit0_write: 0,
+            last_pit0_cycle: 0,
         }
     }
 
@@ -681,6 +821,7 @@ impl Machine {
             }
             0x70 | 0x71 => self.cmos.read(port) as u32,
             0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0xDA => self.dma.read(port) as u32,
+            0x3F0..=0x3F7 => self.fdc.read(port) as u32,
             0x60 | 0x64 => self.ps2.read(port) as u32,
             0x3F8 => self.serial.read(port) as u32,
             0x3FA..=0x3FE => self.serial.read(port) as u32,
@@ -693,9 +834,29 @@ impl Machine {
         let v = data as u8;
         match port {
             0x20 | 0x21 | 0xA0 | 0xA1 => self.pic.write(port, v),
-            0x40..=0x43 => self.pit.write(port, v),
+            0x40..=0x42 => {
+                if port == 0x40 {
+                    self.pit0_writes += 1;
+                    self.last_pit0_write = v;
+                    self.last_pit0_cycle = self.total_cycles;
+                }
+                self.pit.write(port, v);
+            }
+            0x43 => {
+                if v >> 6 == 0 {
+                    self.pit0_cmds += 1;
+                    self.last_pit0_cmd = v;
+                    self.last_pit0_cycle = self.total_cycles;
+                }
+                self.pit.cmd(v);
+            }
             0x70 | 0x71 => self.cmos.write(port, v),
             0x08 | 0x0A | 0x0B | 0x0C | 0x0D | 0xDA => self.dma.write(port, v),
+            0x3F0..=0x3F7 => {
+                if self.fdc.write(port, v) {
+                    self.pic.raise(Irq::Fdc as u8);
+                }
+            }
             0x60 | 0x64 => self.ps2.write(port, v),
             0x3F8 => self.serial.write(port, v),
             0x3FA..=0x3FE => self.serial.write(port, v),
@@ -715,6 +876,25 @@ impl Machine {
         self.pit.tick(cycles);
         if self.pit.timer_fired {
             self.pic.raise(Irq::Timer as u8);
+            self.timer_irqs_raised += 1;
+        }
+    }
+
+    pub fn debug_state(&self) -> MachineDebug {
+        MachineDebug {
+            total_cycles: self.total_cycles,
+            pic_imr: self.pic.master.imr,
+            pic_irr: self.pic.master.irr,
+            pic_isr: self.pic.master.isr,
+            pit_reload0: self.pit.reload[0],
+            pit_phase0: self.pit.phases[0],
+            pit_timer_fired: self.pit.timer_fired,
+            timer_irqs_raised: self.timer_irqs_raised,
+            pit0_cmds: self.pit0_cmds,
+            pit0_writes: self.pit0_writes,
+            last_pit0_cmd: self.last_pit0_cmd,
+            last_pit0_write: self.last_pit0_write,
+            last_pit0_cycle: self.last_pit0_cycle,
         }
     }
 }
@@ -735,5 +915,65 @@ impl Device for Machine {
     }
     fn tick(&mut self, cycles: u64) {
         self.tick(cycles)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pic_command_0x20_is_non_specific_eoi() {
+        let mut pic = Pic::new();
+        pic.write(0x21, 0xFE);
+        pic.raise(Irq::Timer as u8);
+
+        assert_eq!(pic.ack(), Some(0x08));
+        assert_eq!(pic.master.isr & 0x01, 0x01);
+
+        pic.write(0x20, 0x20);
+        assert_eq!(pic.master.isr & 0x01, 0);
+    }
+
+    #[test]
+    fn pit_low_only_access_loads_counter_immediately() {
+        let mut pit = Pit::new();
+        pit.cmd(0x14); // channel 0, low byte only
+        pit.write(0x40, 0x12);
+
+        assert_eq!(pit.reload[0], 0x0012);
+        assert_eq!(pit.phases[0], 0x0012);
+    }
+
+    #[test]
+    fn pit_zero_reload_means_65536() {
+        let mut pit = Pit::new();
+        pit.cmd(0x34); // channel 0, low/high
+        pit.write(0x40, 0x00);
+        pit.write(0x40, 0x00);
+
+        assert_eq!(pit.reload[0], 0);
+        assert_eq!(pit.phases[0], 65_536);
+    }
+
+    #[test]
+    fn pit_channel_zero_starts_running() {
+        let pit = Pit::new();
+
+        assert_eq!(pit.reload[0], 0);
+        assert_eq!(pit.phases[0], 65_536);
+    }
+
+    #[test]
+    fn pit_channel_zero_fires_after_effective_reload() {
+        let mut pit = Pit::new();
+
+        pit.tick(65_535);
+        assert!(!pit.timer_fired);
+        assert_eq!(pit.phases[0], 1);
+
+        pit.tick(1);
+        assert!(pit.timer_fired);
+        assert_eq!(pit.phases[0], 65_536);
     }
 }

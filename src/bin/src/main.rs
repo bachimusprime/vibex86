@@ -153,6 +153,7 @@ fn run_interp(cpu: &mut X86, max_steps: u64, quiet: bool) {
     let mut steps = 0u64;
     let mut last_render = 0u64;
     loop {
+        trace_bios_diskette(cpu, steps);
         match cpu.step() {
             StepOut::Ok | StepOut::Interrupt => {}
             StepOut::Error(e) => {
@@ -185,6 +186,70 @@ fn run_interp(cpu: &mut X86, max_steps: u64, quiet: bool) {
     }
     if !quiet {
         render_frame(cpu);
+    }
+}
+
+fn trace_bios_diskette(cpu: &X86, steps: u64) {
+    if std::env::var_os("VIBEX86_TRACE_DISKETTE").is_none() {
+        return;
+    }
+    match cpu.eip {
+        0x088C | 0x888C => {
+            eprintln!(
+                "trace {steps}: int13 ah={:#04x} al={:#04x} ch={:#04x} cl={:#04x} dh={:#04x} dl={:#04x} es={:#06x} bx={:#06x} bp={:#06x} sp={:#06x}",
+                (cpu.gpr[0] >> 8) as u8,
+                cpu.gpr[0] as u8,
+                (cpu.gpr[1] >> 8) as u8,
+                cpu.gpr[1] as u8,
+                (cpu.gpr[2] >> 8) as u8,
+                cpu.gpr[2] as u8,
+                cpu.seg[0].sel,
+                cpu.gpr[3] as u16,
+                cpu.gpr[5] as u16,
+                cpu.gpr[4] as u16,
+            );
+        }
+        0x8614 | 0x861A | 0x8626 => {
+            let ss_base = cpu.seg[2].desc.base;
+            let bp = cpu.gpr[5] as u16 as u32;
+            eprintln!(
+                "trace {steps}: set_cyl cs={:#06x} eip={:#06x} bp={:#06x} sp={:#06x} arg0={:#06x} arg1={:#06x} stack={:04x?}",
+                cpu.seg[1].sel,
+                cpu.eip,
+                bp,
+                cpu.gpr[4] as u16,
+                cpu.mem.phys_read16(ss_base + bp + 4),
+                cpu.mem.phys_read16(ss_base + bp + 6),
+                [
+                    cpu.mem.phys_read16(ss_base + bp),
+                    cpu.mem.phys_read16(ss_base + bp + 2),
+                    cpu.mem.phys_read16(ss_base + bp + 4),
+                    cpu.mem.phys_read16(ss_base + bp + 6),
+                    cpu.mem.phys_read16(ss_base + bp + 8),
+                    cpu.mem.phys_read16(ss_base + bp + 10),
+                ],
+            );
+        }
+        0x8646 | 0x864D | 0x8654 | 0x866E | 0x8763 => {
+            let ss_base = cpu.seg[2].desc.base;
+            let bp = cpu.gpr[5] as u16 as u32;
+            eprintln!(
+                "trace {steps}: int13-handler cs={:#06x} eip={:#06x} bp={:#06x} drive={:#06x} ah={:#04x} fdpt={:04x?} flags_word={:#06x}",
+                cpu.seg[1].sel,
+                cpu.eip,
+                bp,
+                cpu.mem.phys_read16(ss_base + bp + 0x0e),
+                cpu.mem.phys_read8(ss_base + bp + 0x13),
+                [
+                    cpu.mem.phys_read16(0x408),
+                    cpu.mem.phys_read16(0x40A),
+                    cpu.mem.phys_read16(0x40C),
+                    cpu.mem.phys_read16(0x40E),
+                ],
+                cpu.mem.phys_read16(ss_base + bp + 0x1a),
+            );
+        }
+        _ => {}
     }
 }
 
@@ -268,7 +333,7 @@ fn poll_debug_output(cpu: &mut X86) {
     flush_stdout();
 }
 
-fn print_status(cpu: &X86, steps: u64) {
+fn print_status(cpu: &mut X86, steps: u64) {
     if steps == 0 {
         return;
     }
@@ -284,11 +349,14 @@ fn print_status(cpu: &X86, steps: u64) {
         cpu.gpr[4]
     );
     println!(
-        "cs={:#06x} eip={:#x} eflags={:#x} cr0={:#010x} cr3={:#010x}",
-        cpu.seg[1].sel, cpu.eip, cpu.eflags, cpu.cr[0], cpu.cr[3]
+        "cs={:#06x} eip={:#x} eflags={:#x} halted={} cr0={:#010x} cr3={:#010x}",
+        cpu.seg[1].sel, cpu.eip, cpu.eflags, cpu.halted, cpu.cr[0], cpu.cr[3]
     );
     println!(
-        "bda: shutdown={:#04x} halt_count={:#06x} b800[0..4]={:02x?}",
+        "bda: timer_tick={:#010x} int08={:04x}:{:04x} shutdown={:#04x} halt_count={:#06x} b800[0..4]={:02x?}",
+        cpu.mem.phys_read32(0x46C),
+        cpu.mem.phys_read16(0x08 * 4 + 2),
+        cpu.mem.phys_read16(0x08 * 4),
         cpu.mem.phys_read8(0x4B0),
         cpu.mem.phys_read16(0x73C),
         [
@@ -297,6 +365,31 @@ fn print_status(cpu: &X86, steps: u64) {
             cpu.mem.phys_read8(0xB8002),
             cpu.mem.phys_read8(0xB8003),
         ]
+    );
+    println!(
+        "bda floppy: equip={:#06x} fdpt={:04x?} motor={:#04x} status={:#04x} recal={:#04x} media={:02x?} cyl={:02x?}",
+        cpu.mem.phys_read16(0x410),
+        [
+            cpu.mem.phys_read16(0x408),
+            cpu.mem.phys_read16(0x40A),
+            cpu.mem.phys_read16(0x40C),
+            cpu.mem.phys_read16(0x40E),
+        ],
+        cpu.mem.phys_read8(0x43F),
+        cpu.mem.phys_read8(0x441),
+        cpu.mem.phys_read8(0x43E),
+        [
+            cpu.mem.phys_read8(0x478),
+            cpu.mem.phys_read8(0x479),
+            cpu.mem.phys_read8(0x47A),
+            cpu.mem.phys_read8(0x47B),
+        ],
+        [
+            cpu.mem.phys_read8(0x494),
+            cpu.mem.phys_read8(0x495),
+            cpu.mem.phys_read8(0x496),
+            cpu.mem.phys_read8(0x497),
+        ],
     );
     let ss_base = cpu.seg[2].desc.base;
     let bp = cpu.gpr[5] as u16 as u32;
@@ -319,6 +412,46 @@ fn print_status(cpu: &X86, steps: u64) {
             cpu.mem.phys_read16(ss_base + sp + 6),
         ],
     );
+    let prev_bp = cpu.mem.phys_read16(ss_base + bp) as u32;
+    if prev_bp != 0 {
+        println!(
+            "prev frame: bp={:#06x} [bp..]={:04x?}",
+            prev_bp,
+            [
+                cpu.mem.phys_read16(ss_base + prev_bp),
+                cpu.mem.phys_read16(ss_base + prev_bp + 2),
+                cpu.mem.phys_read16(ss_base + prev_bp + 4),
+                cpu.mem.phys_read16(ss_base + prev_bp + 6),
+                cpu.mem.phys_read16(ss_base + prev_bp + 8),
+                cpu.mem.phys_read16(ss_base + prev_bp + 10),
+                cpu.mem.phys_read16(ss_base + prev_bp + 12),
+                cpu.mem.phys_read16(ss_base + prev_bp + 14),
+            ],
+        );
+    }
+    if let Some(pc) = cpu
+        .mem
+        .device_mut()
+        .and_then(|device| device.as_any_mut().downcast_mut::<Pc>())
+    {
+        let debug = pc.machine.debug_state();
+        println!(
+            "pic/pit: cycles={} imr={:#04x} irr={:#04x} isr={:#04x} reload0={} phase0={} fired={} irq0_raised={} pit0_cmds={} pit0_writes={} last_cmd={:#04x} last_write={:#04x}@{}",
+            debug.total_cycles,
+            debug.pic_imr,
+            debug.pic_irr,
+            debug.pic_isr,
+            debug.pit_reload0,
+            debug.pit_phase0,
+            debug.pit_timer_fired,
+            debug.timer_irqs_raised,
+            debug.pit0_cmds,
+            debug.pit0_writes,
+            debug.last_pit0_cmd,
+            debug.last_pit0_write,
+            debug.last_pit0_cycle,
+        );
+    }
     for vec in 0..=0xffu32 {
         let off = cpu.mem.phys_read16(vec * 4);
         let seg = cpu.mem.phys_read16(vec * 4 + 2);

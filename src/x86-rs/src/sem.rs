@@ -38,7 +38,7 @@ fn sign_bit_for(sz: Bits) -> u32 {
 #[inline]
 pub fn set_flags_zsp(cpu: &mut X86, val: u32, mask: u32) {
     let z = val & mask == 0;
-    let s = val & (mask >> 1) != 0;
+    let s = val & ((mask >> 1).wrapping_add(1)) != 0;
     let p = (val as u8).count_ones() % 2 == 0;
     if z {
         cpu.eflags |= ZF;
@@ -200,6 +200,37 @@ fn write_opnd(cpu: &mut X86, o: &Opnd, v: u32, kind: AccessKind) -> Result<bool,
         }
         _ => Ok(false),
     }
+}
+
+fn read_far_target(cpu: &mut X86, o: &Opnd) -> Result<(u16, u32), Error> {
+    match *o {
+        Opnd::FarPtr { sel, off } => Ok((sel, off)),
+        Opnd::Mem(m, bits) => {
+            let off = eff(cpu, &m);
+            let target = match bits {
+                Bits::B16 => mmu::read16(cpu, m.seg, off, AccessKind::Read)? as u32,
+                Bits::B32 => mmu::read32(cpu, m.seg, off, AccessKind::Read)?,
+                Bits::B8 => return Err(Error::Internal("far pointer cannot be byte-sized".into())),
+            };
+            let sel = mmu::read16(cpu, m.seg, off.wrapping_add(bits.bytes()), AccessKind::Read)?;
+            Ok((sel, target))
+        }
+        _ => Err(Error::Internal("far target operand".into())),
+    }
+}
+
+fn read_near_target(cpu: &mut X86, o: &Opnd, next: u32) -> Result<u32, Error> {
+    match *o {
+        Opnd::Rel { disp } => Ok((next as i64 + disp as i64) as u32),
+        Opnd::Reg(_, _) | Opnd::Mem(_, _) => read_opnd(cpu, o, AccessKind::Read),
+        _ => Ok(next),
+    }
+}
+
+fn far_jump(cpu: &mut X86, sel: u16, off: u32) -> Result<(), Error> {
+    load_segment(cpu, Seg::Cs, sel)?;
+    cpu.eip = off;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +569,7 @@ pub fn real_mode_int(cpu: &mut X86, vector: u8) -> Result<(), Error> {
     let addr = (vector as u32) * 4;
     let off = cpu.mem.phys_read16(addr);
     let seg = cpu.mem.phys_read16(addr + 2);
-    let flags = cpu.eflags & 0o30777;
+    let flags = cpu.eflags & 0xFFFF;
     let cs = cpu.seg[Seg::Cs as usize].sel;
     let ip = cpu.eip as u16;
 
@@ -608,12 +639,35 @@ pub fn dispatch_interrupt(cpu: &mut X86, vector: u8, has_error: bool, code: u32)
     if let Err(e) = push(cpu, 4, code) {
         return StepOut::Error(e);
     }
-    cpu.eflags &= !0x100; // IF
+    cpu.eflags &= !flag::IF;
     cpu.seg[Seg::Cs as usize] = crate::cpu::SegVal::real(selector);
     cpu.eip = offset;
     let _ = size;
     let _ = has_error;
     StepOut::Interrupt
+}
+
+/// Deliver one maskable hardware interrupt before the next instruction.
+///
+/// External devices raise IRQs through the machine PIC, exposed as an INTA-style
+/// `ack_irq` callback. Only acknowledge the PIC when IF is set; otherwise the
+/// request must remain pending in device state.
+pub fn deliver_maskable_interrupt(cpu: &mut X86) -> Option<StepOut> {
+    if cpu.eflags & flag::IF == 0 {
+        return None;
+    }
+
+    if let Some(vec) = cpu.pending_irq.take().or_else(|| cpu.mem.ack_irq()) {
+        cpu.halted = false;
+        return Some(dispatch_interrupt(cpu, vec, false, 0));
+    }
+
+    if cpu.halted {
+        cpu.mem.tick_device(1);
+        return Some(StepOut::Ok);
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,9 +1358,9 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
         }
         Op::Call { far } => {
             if far {
-                let (sel, off) = match d.ops[0] {
-                    Opnd::FarPtr { sel, off } => (sel, off),
-                    _ => return StepOut::Error(Error::Internal("far call no ptr".into())),
+                let (sel, off) = match read_far_target(cpu, &d.ops[0]) {
+                    Ok(v) => v,
+                    Err(e) => return StepOut::Error(e),
                 };
                 if let Err(e) = push(cpu, size, cpu.seg[Seg::Cs as usize].sel as u32) {
                     return StepOut::Error(e);
@@ -1314,10 +1368,14 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
                 if let Err(e) = push(cpu, size, next) {
                     return StepOut::Error(e);
                 }
-                cpu.seg[Seg::Cs as usize] = crate::cpu::SegVal::real(sel);
-                cpu.eip = off;
+                if let Err(e) = far_jump(cpu, sel, off) {
+                    return StepOut::Error(e);
+                }
             } else {
-                let target = d.rel_target(next);
+                let target = match read_near_target(cpu, &d.ops[0], next) {
+                    Ok(v) => v,
+                    Err(e) => return StepOut::Error(e),
+                };
                 if let Err(e) = push(cpu, size, next) {
                     return StepOut::Error(e);
                 }
@@ -1327,14 +1385,18 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
         }
         Op::Jump { far } => {
             if far {
-                let (sel, off) = match d.ops[0] {
-                    Opnd::FarPtr { sel, off } => (sel, off),
-                    _ => return StepOut::Error(Error::Internal("far jmp no ptr".into())),
+                let (sel, off) = match read_far_target(cpu, &d.ops[0]) {
+                    Ok(v) => v,
+                    Err(e) => return StepOut::Error(e),
                 };
-                cpu.seg[Seg::Cs as usize] = crate::cpu::SegVal::real(sel);
-                cpu.eip = off;
+                if let Err(e) = far_jump(cpu, sel, off) {
+                    return StepOut::Error(e);
+                }
             } else {
-                cpu.eip = d.rel_target(next);
+                cpu.eip = match read_near_target(cpu, &d.ops[0], next) {
+                    Ok(v) => v,
+                    Err(e) => return StepOut::Error(e),
+                };
             }
             StepOut::Ok
         }
@@ -1747,10 +1809,17 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
             cpu.eip = next;
             StepOut::Ok
         }
-        Op::Int(v) => dispatch_interrupt(cpu, v, false, 0),
-        Op::Int3 => dispatch_interrupt(cpu, 3, false, 0),
+        Op::Int(v) => {
+            cpu.eip = next;
+            dispatch_interrupt(cpu, v, false, 0)
+        }
+        Op::Int3 => {
+            cpu.eip = next;
+            dispatch_interrupt(cpu, 3, false, 0)
+        }
         Op::Into => {
             if cpu.eflags & OF != 0 {
+                cpu.eip = next;
                 dispatch_interrupt(cpu, 4, false, 0)
             } else {
                 cpu.eip = next;
@@ -1783,8 +1852,7 @@ pub fn exec(cpu: &mut X86, d: &Decoded) -> StepOut {
         Op::Hlt => {
             cpu.eip = next;
             if cpu.eflags & flag::IF != 0 {
-                // Run devices to give interrupts a chance.
-                cpu.mem.tick_device(1);
+                cpu.halted = true;
                 StepOut::Ok
             } else {
                 StepOut::Error(Error::Halt)
@@ -2412,6 +2480,16 @@ fn load_segment(cpu: &mut X86, seg: Seg, sel: u16) -> Result<(), Error> {
         cpu.seg[seg as usize] = crate::cpu::SegVal::real(sel);
         return Ok(());
     }
+    if sel & !3 == 0 {
+        if matches!(seg, Seg::Cs | Seg::Ss) {
+            return Err(Error::Internal("null CS/SS selector".into()));
+        }
+        cpu.seg[seg as usize] = crate::cpu::SegVal {
+            sel,
+            desc: Desc::NULL,
+        };
+        return Ok(());
+    }
     // Protected mode: load GDT/LDT descriptor.
     let d = load_descriptor(cpu, sel)?;
     if !d.p {
@@ -2440,8 +2518,8 @@ fn load_descriptor(cpu: &X86, sel: u16) -> Result<Desc, Error> {
     let addr = base.wrapping_add(index * 8);
     let lo = cpu.mem.phys_read32(addr);
     let hi = cpu.mem.phys_read32(addr + 4);
-    let base = (lo & 0xFFFF) | ((lo >> 16) & 0xFF) << 16 | (hi & 0xFF) << 24;
-    let limit = (lo >> 16 & 0xF) | (hi & 0xF) << 16;
+    let base = ((lo >> 16) & 0xFFFF) | ((hi & 0xFF) << 16) | ((hi >> 24) << 24);
+    let limit = (lo & 0xFFFF) | (((hi >> 16) & 0xF) << 16);
     let g = hi & (1 << 23) != 0;
     let db = hi & (1 << 22) != 0;
     let p = hi & (1 << 15) != 0;

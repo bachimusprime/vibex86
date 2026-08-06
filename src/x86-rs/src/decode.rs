@@ -1050,6 +1050,30 @@ impl<'a> Decoder<'a> {
             0xA5 => Ok(self.fin(Op::Movs(size), [Opnd::None; 4], o16, a16, seg_ov)),
             0xA6 => Ok(self.fin(Op::Cmps(Bits::B8), [Opnd::None; 4], o16, a16, seg_ov)),
             0xA7 => Ok(self.fin(Op::Cmps(size), [Opnd::None; 4], o16, a16, seg_ov)),
+            0xA8 => {
+                let imm = self.raw()? as u32;
+                Ok(self.fin(
+                    Op::Test,
+                    [acc(Bits::B8), Opnd::Imm(imm), Opnd::None, Opnd::None],
+                    o16,
+                    a16,
+                    seg_ov,
+                ))
+            }
+            0xA9 => {
+                let imm = if o16 {
+                    self.raw16()? as u32
+                } else {
+                    self.raw32()?
+                };
+                Ok(self.fin(
+                    Op::Test,
+                    [acc(size), Opnd::Imm(imm), Opnd::None, Opnd::None],
+                    o16,
+                    a16,
+                    seg_ov,
+                ))
+            }
             0xAA => Ok(self.fin(Op::Stos(Bits::B8), [Opnd::None; 4], o16, a16, seg_ov)),
             0xAB => Ok(self.fin(Op::Stos(size), [Opnd::None; 4], o16, a16, seg_ov)),
             0xAC => Ok(self.fin(Op::Lods(Bits::B8), [Opnd::None; 4], o16, a16, seg_ov)),

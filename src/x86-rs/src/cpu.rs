@@ -302,6 +302,7 @@ pub struct X86 {
     pub pending_irq: Option<u8>,
     pub mem: Mem,
     pub cycles: u64,
+    pub halted: bool,
     /// Force interpreter mode (used by tests/diagnostics).
     pub force_interp: bool,
 }
@@ -331,6 +332,7 @@ impl X86 {
             pending_irq: None,
             mem,
             cycles: 0,
+            halted: false,
             force_interp: false,
         }
     }
@@ -356,6 +358,7 @@ impl X86 {
         self.tss = Tss::default();
         self.pending_irq = None;
         self.cycles = 0;
+        self.halted = false;
     }
 
     // ---- register accessors ----

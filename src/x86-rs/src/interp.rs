@@ -2,7 +2,7 @@
 //! `sem` layer. This is also the fallback engine used by the JIT for any
 //! instruction or mode it declines to compile.
 
-use crate::cpu::{Error, StepOut, X86, flag};
+use crate::cpu::{Error, StepOut, X86};
 use crate::decode;
 use crate::sem;
 
@@ -14,13 +14,8 @@ pub struct Interpreter;
 
 /// Execute one instruction (including interrupt delivery between instructions).
 pub fn step(cpu: &mut X86) -> StepOut {
-    // Pending maskable interrupt: deliver before the next instruction if IF set.
-    if let Some(vec) = cpu.pending_irq.take() {
-        if cpu.eflags & flag::IF != 0 {
-            return dispatch_interrupt(cpu, vec, false, 0);
-        }
-        // IF cleared: keep it pending and continue.
-        cpu.pending_irq = Some(vec);
+    if let Some(out) = sem::deliver_maskable_interrupt(cpu) {
+        return out;
     }
 
     cpu.cycles = cpu.cycles.wrapping_add(1);

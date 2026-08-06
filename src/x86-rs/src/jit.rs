@@ -484,13 +484,9 @@ impl Jit {
     pub fn run(&mut self, cpu: &mut X86, limit: u64) -> Result<u64, Error> {
         let mut count = 0u64;
         while count < limit {
-            if let Some(vec) = cpu.pending_irq.take() {
-                if cpu.eflags & flag::IF != 0 {
-                    sem::dispatch_interrupt(cpu, vec, false, 0);
-                    count += 1;
-                    continue;
-                }
-                cpu.pending_irq = Some(vec);
+            if sem::deliver_maskable_interrupt(cpu).is_some() {
+                count += 1;
+                continue;
             }
 
             let (status, n) = {

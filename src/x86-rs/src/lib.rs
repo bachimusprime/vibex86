@@ -47,6 +47,33 @@ pub fn new_core() -> X86 {
 mod tests {
     use super::*;
     use crate::cpu::{SegVal, flag};
+    use crate::mem::Device;
+    use std::any::Any;
+
+    struct FakeIrqDevice {
+        irq: Option<u8>,
+        ticks: u64,
+    }
+
+    impl Device for FakeIrqDevice {
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn io_read(&mut self, _port: u16, _size: u8) -> u32 {
+            0xFF
+        }
+
+        fn io_write(&mut self, _port: u16, _size: u8, _data: u32) {}
+
+        fn ack_irq(&mut self) -> Option<u8> {
+            self.irq.take()
+        }
+
+        fn tick(&mut self, cycles: u64) {
+            self.ticks += cycles;
+        }
+    }
 
     fn core_with(code: &[u8]) -> X86 {
         let mut cpu = X86::new();
@@ -109,6 +136,26 @@ mod tests {
         step_ok(&mut cpu);
         assert_eq!(cpu.reg8(0), 0x80);
         assert_ne!(cpu.eflags & flag::OF, 0);
+    }
+
+    #[test]
+    fn sign_flag_uses_only_the_operand_sign_bit() {
+        let mut cpu = core_with(&[
+            0xB8, 0x06, 0x00, // mov ax,6
+            0x83, 0xF8, 0x00, // cmp ax,0
+            0x7C, 0x03, // jl skipped
+            0xB8, 0x34, 0x12, // mov ax,1234h
+        ]);
+
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eflags & flag::SF, 0);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 8);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.reg16(0), 0x1234);
     }
 
     #[test]
@@ -222,6 +269,202 @@ mod tests {
     }
 
     #[test]
+    fn far_indirect_jump_reads_memory_pointer() {
+        let mut cpu = core_with(&[
+            0xFF, 0x2E, 0x00, 0x01, // ljmp far [0100h]
+        ]);
+        cpu.mem.phys_write16(0x0100, 0x0020);
+        cpu.mem.phys_write16(0x0102, 0x1234);
+
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.seg[Seg::Cs as usize].sel, 0x1234);
+        assert_eq!(cpu.eip, 0x0020);
+    }
+
+    #[test]
+    fn near_indirect_jump_reads_memory_pointer() {
+        let mut cpu = core_with(&[
+            0xBB, 0x02, 0x00, // mov bx,2
+            0xFF, 0xA7, 0x00, 0x01, // jmp word [bx+0100h]
+        ]);
+        cpu.mem.phys_write16(0x0102, 0x0040);
+
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.eip, 0x0040);
+    }
+
+    #[test]
+    fn protected_far_jump_loads_descriptor_base_and_limit() {
+        let mut cpu = core_with(&[
+            0x66, 0xEA, 0x78, 0x56, 0x34, 0x12, 0x08, 0x00, // jmp 8:12345678h
+        ]);
+        cpu.cr[0] = 1;
+        cpu.gdtr.base = 0x0200;
+        cpu.gdtr.limit = 0x0010;
+        cpu.mem.phys_write32(0x0208, 0x0000_FFFF);
+        cpu.mem.phys_write32(0x020C, 0x00CF_9A12);
+
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.seg[Seg::Cs as usize].sel, 0x0008);
+        assert_eq!(cpu.seg[Seg::Cs as usize].desc.base, 0x0012_0000);
+        assert_eq!(cpu.seg[Seg::Cs as usize].desc.limit, 0x000F_FFFF);
+        assert_eq!(cpu.seg[Seg::Cs as usize].desc.eff_limit(), 0xFFFF_FFFF);
+        assert_eq!(cpu.eip, 0x1234_5678);
+    }
+
+    #[test]
+    fn protected_data_segments_accept_null_selector() {
+        let mut cpu = core_with(&[
+            0x8E, 0xD8, // mov ds,ax
+        ]);
+        cpu.cr[0] = 1;
+        cpu.gpr[Reg::Eax as usize] = 0;
+
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.seg[Seg::Ds as usize].sel, 0);
+        assert!(!cpu.seg[Seg::Ds as usize].desc.p);
+    }
+
+    #[test]
+    fn test_accumulator_immediate_opcodes_decode_and_set_flags() {
+        let mut cpu = core_with(&[
+            0xA8, 0x10, // test al,10h
+            0xA9, 0x00, 0x80, // test ax,8000h
+        ]);
+        cpu.set_reg8(0, 0x10);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eflags & flag::ZF, 0);
+
+        cpu.set_reg16(0, 0x7FFF);
+        step_ok(&mut cpu);
+        assert_ne!(cpu.eflags & flag::ZF, 0);
+    }
+
+    #[test]
+    fn software_interrupt_returns_to_following_instruction() {
+        let mut cpu = core_with(&[
+            0xCD, 0x10, // int 10h
+            0xB8, 0x34, 0x12, // mov ax,1234h
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        cpu.eflags |= flag::IF;
+        cpu.mem.phys_write16(0x10 * 4, 0x0200);
+        cpu.mem.phys_write16(0x10 * 4 + 2, 0x0000);
+        cpu.mem.phys_write8(0x0200, 0xCF); // iret
+
+        assert_eq!(cpu.step(), StepOut::Interrupt);
+        assert_eq!(cpu.eip, 0x0200);
+        assert_eq!(cpu.mem.phys_read16(0x0FFA), 0x0002);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 0x0002);
+        assert_ne!(cpu.eflags & flag::IF, 0);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.reg16(0), 0x1234);
+    }
+
+    #[test]
+    fn interpreter_acknowledges_device_irq_when_if_is_set() {
+        let mut cpu = core_with(&[
+            0xB8, 0x34, 0x12, // mov ax,1234h
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        cpu.eflags |= flag::IF;
+        cpu.mem.phys_write16(0x08 * 4, 0x0200);
+        cpu.mem.phys_write16(0x08 * 4 + 2, 0x0000);
+        cpu.mem.phys_write8(0x0200, 0xCF); // iret
+        cpu.mem.install_device(Box::new(FakeIrqDevice {
+            irq: Some(0x08),
+            ticks: 0,
+        }));
+
+        assert_eq!(cpu.step(), StepOut::Interrupt);
+        assert_eq!(cpu.eip, 0x0200);
+        assert_eq!(cpu.mem.phys_read16(0x0FFA), 0x0000);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 0x0000);
+        assert_ne!(cpu.eflags & flag::IF, 0);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.reg16(0), 0x1234);
+    }
+
+    #[test]
+    fn nested_real_mode_interrupt_restores_outer_flags_after_cli() {
+        let mut cpu = core_with(&[
+            0xB8, 0x34, 0x12, // mov ax,1234h
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        cpu.eflags |= flag::IF;
+        cpu.mem.phys_write16(0x08 * 4, 0x0200);
+        cpu.mem.phys_write16(0x08 * 4 + 2, 0x0000);
+        cpu.mem.phys_write16(0x1C * 4, 0x0300);
+        cpu.mem.phys_write16(0x1C * 4 + 2, 0x0000);
+        cpu.mem.phys_write_block(
+            0x0200,
+            &[
+                0xFB, // sti
+                0xCD, 0x1C, // int 1ch
+                0xFA, // cli
+                0xCF, // iret
+            ],
+        );
+        cpu.mem.phys_write8(0x0300, 0xCF); // iret
+        cpu.mem.install_device(Box::new(FakeIrqDevice {
+            irq: Some(0x08),
+            ticks: 0,
+        }));
+
+        assert_eq!(cpu.step(), StepOut::Interrupt);
+        step_ok(&mut cpu);
+        assert_eq!(cpu.step(), StepOut::Interrupt);
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+        step_ok(&mut cpu);
+
+        assert_eq!(cpu.eip, 0x0000);
+        assert_ne!(cpu.eflags & flag::IF, 0);
+    }
+
+    #[test]
+    fn hlt_waits_at_next_eip_until_irq_arrives() {
+        let mut cpu = core_with(&[
+            0xF4, // hlt
+            0xB8, 0x34, 0x12, // mov ax,1234h
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        cpu.eflags |= flag::IF;
+        cpu.mem.phys_write16(0x08 * 4, 0x0200);
+        cpu.mem.phys_write16(0x08 * 4 + 2, 0x0000);
+        cpu.mem.phys_write8(0x0200, 0xCF); // iret
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 1);
+        assert!(cpu.halted);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 1);
+        assert!(cpu.halted);
+
+        cpu.pending_irq = Some(0x08);
+        assert_eq!(cpu.step(), StepOut::Interrupt);
+        assert!(!cpu.halted);
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 1);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.reg16(0), 0x1234);
+    }
+
+    #[test]
     fn repne_scasb_stops_on_match_and_updates_count() {
         let mut cpu = core_with(&[
             0xF2, 0xAE, // repne scasb
@@ -304,5 +547,64 @@ mod tests {
 
         assert_eq!(cpu.reg16(0), 0x1234);
         assert_eq!(cpu.reg16(1), 0);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_test_accumulator_immediate_runs_natively() {
+        let mut cpu = core_with(&[
+            0xA8, 0x10, // test al,10h
+            0xEB, 0x00, // jmp next
+        ]);
+        cpu.set_reg8(0, 0x10);
+        let mut jit = Jit::new().unwrap();
+
+        assert_eq!(jit.run(&mut cpu, 2), Ok(2));
+
+        assert_eq!(cpu.eflags & flag::ZF, 0);
+        assert_eq!(cpu.eip, 4);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_near_indirect_jump_reads_memory_pointer() {
+        let mut cpu = core_with(&[
+            0xBB, 0x02, 0x00, // mov bx,2
+            0xFF, 0xA7, 0x00, 0x01, // jmp word [bx+0100h]
+        ]);
+        cpu.mem.phys_write16(0x0102, 0x0040);
+        let mut jit = Jit::new().unwrap();
+
+        assert_eq!(jit.run(&mut cpu, 2), Ok(2));
+
+        assert_eq!(cpu.eip, 0x0040);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_acknowledges_device_irq_when_if_is_set() {
+        let mut cpu = core_with(&[
+            0xB8, 0x34, 0x12, // mov ax,1234h
+        ]);
+        cpu.gpr[Reg::Esp as usize] = 0x1000;
+        cpu.eflags |= flag::IF;
+        cpu.mem.phys_write16(0x08 * 4, 0x0200);
+        cpu.mem.phys_write16(0x08 * 4 + 2, 0x0000);
+        cpu.mem.phys_write8(0x0200, 0xCF); // iret
+        cpu.mem.install_device(Box::new(FakeIrqDevice {
+            irq: Some(0x08),
+            ticks: 0,
+        }));
+        let mut jit = Jit::new().unwrap();
+
+        assert_eq!(jit.run(&mut cpu, 1), Ok(1));
+        assert_eq!(cpu.eip, 0x0200);
+
+        step_ok(&mut cpu);
+        assert_eq!(cpu.eip, 0x0000);
+        assert_ne!(cpu.eflags & flag::IF, 0);
+
+        assert_eq!(jit.run(&mut cpu, 1), Ok(1));
+        assert_eq!(cpu.reg16(0), 0x1234);
     }
 }
